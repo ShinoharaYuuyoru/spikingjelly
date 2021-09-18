@@ -49,20 +49,17 @@ from torch.utils.data import DataLoader
 from torch.utils.tensorboard import SummaryWriter
 import torchvision.transforms
 from torchaudio.transforms import Spectrogram
-from spikingjelly.cext import neuron as cext_neuron
+from spikingjelly.clock_driven import neuron, surrogate
 
 from spikingjelly.datasets.speechcommands import SPEECHCOMMANDS
 from spikingjelly.clock_driven.functional import reset_net
 from scipy.signal import savgol_filter
 
 from sklearn.metrics import confusion_matrix
-import matplotlib.pyplot as plt
 
-import scipy
 import numpy as np
 
 import math
-import os
 import time
 import argparse
 from typing import Optional
@@ -75,6 +72,12 @@ f_max = 4000
 f_min = 20
 delta_order = 0
 size = 16000
+try:
+    import cupy
+    backend = 'cupy'
+except ModuleNotFoundError:
+    backend = 'torch'
+    print('Cupy is not intalled. Using torch backend for neurons.')
 
 def mel_to_hz(mels, dct_type):
     if dct_type == 'htk':
@@ -300,17 +303,17 @@ class Net(nn.Module):
             # 101 * 40
             nn.Conv2d(in_channels=delta_order+1, out_channels=64,
                       kernel_size=(4, 3), stride=1, padding=(2, 1), bias=False),
-            LIFWrapper(cext_neuron.MultiStepLIFNode(tau=10.0 / 7, surrogate_function='Sigmoid', alpha=10.0)),
+            LIFWrapper(neuron.MultiStepLIFNode(tau=10.0 / 7, surrogate_function=surrogate.Sigmoid(alpha=10.), backend=backend)),
 
             # 102 * 40
             nn.Conv2d(in_channels=64, out_channels=64,
                       kernel_size=(4, 3), stride=1, padding=(6, 3), dilation=(4, 3), bias=False),
-            LIFWrapper(cext_neuron.MultiStepLIFNode(tau=10.0 / 7, surrogate_function='Sigmoid', alpha=10.0)),
+            LIFWrapper(neuron.MultiStepLIFNode(tau=10.0 / 7, surrogate_function=surrogate.Sigmoid(alpha=10.), backend=backend)),
 
             # 102 * 40
                 nn.Conv2d(in_channels=64, out_channels=64,
                       kernel_size=(4, 3), stride=1, padding=(24, 9), dilation=(16, 9), bias=False),
-            LIFWrapper(cext_neuron.MultiStepLIFNode(tau=10.0 / 7, surrogate_function='Sigmoid', alpha=10.0), flatten=True),
+            LIFWrapper(neuron.MultiStepLIFNode(tau=10.0 / 7, surrogate_function=surrogate.Sigmoid(alpha=10.), backend=backend), flatten=True),
         )
         # [batch size, T, channel * n_mel]
         self.fc = nn.Linear(64 * 40, label_cnt)
@@ -327,6 +330,7 @@ if __name__ == '__main__':
     parser.add_argument('-lr', '--learning-rate', type=float, default=1e-2)
     parser.add_argument('-dir', '--dataset-dir', type=str)
     parser.add_argument('-e', '--epoch', type=int, default=50)
+    parser.add_argument('-d', '--device', type=str, default='cuda:0')
     args = parser.parse_args()
 
     sr = args.sample_rate
@@ -336,6 +340,7 @@ if __name__ == '__main__':
     batch_size = args.batch_size
     lr = args.learning_rate
     epoch = args.epoch
+    device = args.device
 
     pad = Pad(size)
     spec = Spectrogram(n_fft=n_fft, hop_length=hop_length)
@@ -362,7 +367,7 @@ if __name__ == '__main__':
     test_dataloader = DataLoader(test_dataset, batch_size=batch_size, num_workers=16, collate_fn=collate_fn, shuffle=False,
                                  drop_last=False)
 
-    net = Net().cuda()
+    net = Net().to(device)
 
     optimizer = Adam(net.parameters(), lr=lr)
     gamma = 0.85
@@ -372,7 +377,7 @@ if __name__ == '__main__':
 
     writer = SummaryWriter('./logs/')
 
-    criterion = nn.CrossEntropyLoss().cuda()
+    criterion = nn.CrossEntropyLoss().to(device)
 
     for e in range(epoch):
         net.train()
@@ -381,8 +386,8 @@ if __name__ == '__main__':
         time_start = time.time()
         ##### TRAIN #####
         for audios, labels in tqdm(train_dataloader):
-            audios = audios.cuda(non_blocking=True)
-            labels = labels.cuda(non_blocking=True)
+            audios = audios.to(device, non_blocking=True)
+            labels = labels.to(device, non_blocking=True)
 
             optimizer.zero_grad()
 

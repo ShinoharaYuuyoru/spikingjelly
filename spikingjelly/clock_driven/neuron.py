@@ -316,8 +316,8 @@ class MultiStepIFNode(IFNode):
 
         if self.backend == 'torch':
             for t in range(x_seq.shape[0]):
-                self.spike_seq[t] = super().forward(x_seq[t]).clone()
-                self.v_seq[t] = self.v.clone()
+                self.spike_seq[t] = super().forward(x_seq[t])
+                self.v_seq[t] = self.v
             return self.spike_seq
 
         elif self.backend == 'cupy':
@@ -330,7 +330,6 @@ class MultiStepIFNode(IFNode):
 
             self.spike_seq, self.v_seq = neuron_kernel.MultiStepIFNodePTT.apply(
                 x_seq, self.v, self.v_threshold, self.v_reset, self.detach_reset, self.surrogate_function.cuda_code)
-
 
             self.spike = self.spike_seq[-1].clone()
             self.v = self.v_seq[-1].clone()
@@ -508,8 +507,8 @@ class MultiStepLIFNode(LIFNode):
 
         if self.backend == 'torch':
             for t in range(x_seq.shape[0]):
-                self.spike_seq[t] = super().forward(x_seq[t]).clone()
-                self.v_seq[t] = self.v.clone()
+                self.spike_seq[t] = super().forward(x_seq[t])
+                self.v_seq[t] = self.v
             return self.spike_seq
 
         elif self.backend == 'cupy':
@@ -522,7 +521,6 @@ class MultiStepLIFNode(LIFNode):
 
             self.spike_seq, self.v_seq = neuron_kernel.MultiStepLIFNodePTT.apply(
                 x_seq, self.v, self.tau, self.v_threshold, self.v_reset, self.detach_reset, self.surrogate_function.cuda_code)
-
 
             self.spike = self.spike_seq[-1].clone()
             self.v = self.v_seq[-1].clone()
@@ -716,8 +714,8 @@ class MultiStepParametricLIFNode(ParametricLIFNode):
 
         if self.backend == 'torch':
             for t in range(x_seq.shape[0]):
-                self.spike_seq[t] = super().forward(x_seq[t]).clone()
-                self.v_seq[t] = self.v.clone()
+                self.spike_seq[t] = super().forward(x_seq[t])
+                self.v_seq[t] = self.v
             return self.spike_seq
 
         elif self.backend == 'cupy':
@@ -730,7 +728,6 @@ class MultiStepParametricLIFNode(ParametricLIFNode):
 
             self.spike_seq, self.v_seq = neuron_kernel.MultiStepParametricLIFNodePTT.apply(
                 x_seq, self.v, self.w.sigmoid(), self.v_threshold, self.v_reset, self.detach_reset, self.surrogate_function.cuda_code)
-
 
             self.spike = self.spike_seq[-1].clone()
             self.v = self.v_seq[-1].clone()
