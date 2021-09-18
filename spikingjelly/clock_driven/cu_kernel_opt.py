@@ -34,18 +34,34 @@ try:
     def cal_blocks(numel: int):
         return (numel + threads - 1) // threads
 
-    def wrap_args_to_raw_kernel(device: int, args_list: list):
-        # check device and contiguous
+    def get_contiguous(*args):
         ret_list = []
-        for item in args_list:
+        for item in args:
+            if isinstance(item, torch.Tensor):
+                ret_list.append(item.contiguous())
+
+            elif isinstance(item, cupy.ndarray):
+                ret_list.append(cupy.ascontiguousarray(item))
+
+            else:
+                raise TypeError
+        return ret_list
+
+    def wrap_args_to_raw_kernel(device: int, *args):
+        # note that the input must be contiguous
+        # check device and get data_ptr from tensor
+        ret_list = []
+        for item in args:
             if isinstance(item, torch.Tensor):
                 assert item.get_device() == device
-                item = item.contiguous()
+                assert item.is_contiguous()
                 ret_list.append(item.data_ptr())
+
             elif isinstance(item, cupy.ndarray):
                 assert item.device.id == device
-                item = cupy.ascontiguousarray(item)
+                assert item.flags['C_CONTIGUOUS']
                 ret_list.append(item)
+
             else:
                 raise TypeError
 
