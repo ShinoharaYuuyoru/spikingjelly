@@ -58,9 +58,11 @@
 
 .. code-block:: python
 
-    net.train()
     print("Epoch {}:".format(epoch))
     print("Training...")
+    train_correct_sum = 0
+    train_sum = 0
+    net.train()
     for img, label in tqdm(train_data_loader):
         img = img.to(device)
         label = label.to(device)
@@ -88,12 +90,15 @@
         functional.reset_net(net)
 
         # 正确率的计算方法如下。认为输出层中脉冲发放频率最大的神经元的下标i是分类结果
-        train_accuracy = (out_spikes_counter_frequency.max(1)[1] == label.to(device)).float().mean().item()
-        
-        writer.add_scalar('train_accuracy', train_accuracy, train_times)
-        train_accs.append(train_accuracy)
+        train_correct_sum += (out_spikes_counter_frequency.max(1)[1] == label.to(device)).float().sum().item()
+        train_sum += label.numel()
+
+        train_batch_accuracy = (out_spikes_counter_frequency.max(1)[1] == label.to(device)).float().mean().item()
+        writer.add_scalar('train_batch_accuracy', train_batch_accuracy, train_times)
+        train_accs.append(train_batch_accuracy)
 
         train_times += 1
+    train_accuracy = train_correct_sum / train_sum
 
 完整的代码位于\ ``clock_driven.examples.lif_fc_mnist.py``\ ，在代码中我们还使用了Tensorboard来保存训练日志。可以直接在命令行运行它：
 
