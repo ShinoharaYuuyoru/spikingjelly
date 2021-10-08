@@ -16,7 +16,7 @@ SpikingJelly的文档使用中英双语编写： https://spikingjelly.readthedoc
 - [设备支持](#设备支持)
 - [神经形态数据集支持](#神经形态数据集支持)
 - [教程](#教程)
-- [引用](#引用)
+- [出版物与引用](#出版物与引用)
 - [贡献](#贡献)
 - [项目信息](#项目信息)
 
@@ -121,9 +121,11 @@ class ANN(nn.Module):
 
 SpikingJelly为多步神经元（阅读[教程](#教程)以获取更多信息）提供给了2种后端。可以使用对用户友好的`torch`后端进行快速开发，并使用`cupy`后端进行高效训练。
 
-下图对比了2种后端的多步LIF神经元的运行时长：
+下图对比了2种后端的多步LIF神经元 (`float32`) 的运行时长：
 
 <img src="./docs/source/_static/tutorials/clock_driven/11_cext_neuron_with_lbl/exe_time_fb.png" alt="exe_time_fb"  />
+
+`cupy`后端同样接支持`float16`，并且可以在[自动混合精度训练](https://pytorch.org/docs/stable/notes/amp_examples.html)中使用。
 
 若想使用`cupy`后端，请安装 [CuPy](https://docs.cupy.dev/en/stable/install.html)。`cupy`后端仅支持GPU，而`torch`后端同时支持CPU和GPU。
 
@@ -183,7 +185,9 @@ SpikingJelly精心准备了多项教程。下面展示了部分教程：
 | ![t13](./docs/source/_static/tutorials/clock_driven/13_neuromorphic_datasets/dvsg.gif) | [神经形态数据集处理](https://spikingjelly.readthedocs.io/zh_CN/latest/clock_driven/13_neuromorphic_datasets.html) |
 | ![t14](./docs/source/_static/tutorials/clock_driven/14_classify_dvsg/test_acc.png) | [分类DVS128 Gesture](https://spikingjelly.readthedocs.io/zh_CN/latest/clock_driven/14_classify_dvsg.html) |
 
-## 引用
+## 出版物与引用
+
+[出版物列表](./publications.md)中保存了已知的使用惊蜇(SpikingJelly)的出版物。如果你的文章也使用了惊蜇(SpikingJelly)，可以通过提交pull request的方式来更新出版物列表。
 
 如果您在自己的工作中用到了惊蜇(SpikingJelly)，您可以按照下列格式进行引用：
 
