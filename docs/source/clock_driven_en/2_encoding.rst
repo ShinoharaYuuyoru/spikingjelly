@@ -15,10 +15,7 @@ All encodes are based on two base encoders:
 
     2.The stateful base encoder :class:`spikingjelly.clock_driven.encoding.StatefulEncoder`
 
-There are no hidden states in the stateless encoder, and the spikes ``spike[t]`` will be encoded from the input data
-``x[t]`` at time-step ``t``. While the stateful encoder ``encoder = StatefulEncoder(T)`` will use ``encode`` function
-to encode the input sequence ``x`` containing ``T`` time-steps data to ``spike`` at the first time of ``forward``, and
-will output ``spike[t % T]`` at the``t``-th calling ``forward``. The codes of :class:`spikingjelly.clock_driven.encoding.StatefulEncoder.forward` are:
+There are no hidden states in the stateless encoder, and the spikes ``spike[t]`` will be encoded from the input data ``x[t]`` at time-step ``t``. While the stateful encoder ``encoder = StatefulEncoder(T)`` will use ``encode`` function to encode the input sequence ``x`` containing ``T`` time-steps data to ``spike`` at the first time of ``forward``, and will output ``spike[t % T]`` at the``t``-th calling ``forward``. The codes of :class:`spikingjelly.clock_driven.encoding.StatefulEncoder.forward` are:
 
 .. code-block:: python
 
@@ -34,16 +31,9 @@ will output ``spike[t % T]`` at the``t``-th calling ``forward``. The codes of :c
 
 Poisson Encoder
 -----------------
-The Poisson encoder :class:`spikingjelly.clock_driven.encoding.PoissonEncoder` is a stateless encoder. It converts the input data ``x`` into a spike with the same shape, which conforms to a Poisson process, i.e., the number of spikes during a certain period follows a Poisson distribution.
-A Poisson process is also called a Poisson flow. When a spike flow satisfies the requirements of independent increment,
-incremental stability and commonality, such a spike flow is a Poisson flow. More specifically, in the entire spike
-stream, the number of spikes appearing in disjoint intervals is independent of each other, and in any interval,
-the number of spikes is related to the length of the interval while not the starting point of the interval.
-Therefore, in order to realize Poisson encoding, we set the firing probability of a
-time step :math:`p=x`, where :math:`x` needs to be normalized to [0, 1].
+The Poisson encoder :class:`spikingjelly.clock_driven.encoding.PoissonEncoder` is a stateless encoder. It converts the input data ``x`` into a spike with the same shape, which conforms to a Poisson process, i.e., the number of spikes during a certain period follows a Poisson distribution. A Poisson process is also called a Poisson flow. When a spike flow satisfies the requirements of independent increment, incremental stability and commonality, such a spike flow is a Poisson flow. More specifically, in the entire spike stream, the number of spikes appearing in disjoint intervals is independent of each other, and in any interval, the number of spikes is related to the length of the interval while not the starting point of the interval. Therefore, in order to realize Poisson encoding, we set the firing probability of a time step :math:`p=x`, where :math:`x` needs to be normalized to [0, 1].
 
-Example: The input image is `lena512.bmp <https://www.ece.rice.edu/~wakin/images/lena512.bmp>`_ , and 20 time
-steps are simulated to obtain 20 spike matrices.
+Example: The input image is `lena512.bmp <https://www.ece.rice.edu/~wakin/images/lena512.bmp>`_ , and 20 time steps are simulated to obtain 20 spike matrices.
 
 .. code-block:: python
 
@@ -84,12 +74,9 @@ The original grayscale image of Lena and 20 resulted spike matrices are as follo
 .. image:: ../_static/tutorials/clock_driven/2_encoding/4.*
     :width: 100%
 
-Comparing the original grayscale image to the spike matrix, it can be found that the spike matrix is
-very close to the contour of the original grayscale image, which shows the superiority of the
-Poisson encoder.
+Comparing the original grayscale image to the spike matrix, it can be found that the spike matrix is very close to the contour of the original grayscale image, which shows the superiority of the Poisson encoder.
 
-After simulating the Poisson encoder with the Lena grayscale image for 512 time steps, we superimpose the spike matrix obtained
-in each step, and obtain the result of the superposition of steps 1, 128, 256, 384, and 512, and draw the picture:
+After simulating the Poisson encoder with the Lena grayscale image for 512 time steps, we superimpose the spike matrix obtained in each step, and obtain the result of the superposition of steps 1, 128, 256, 384, and 512, and draw the picture:
 
 .. code-block:: python
 
@@ -119,14 +106,12 @@ The superimposed images are as follows:
 .. image:: ../_static/tutorials/clock_driven/2_encoding/5.*
     :width: 100%
 
-It can be seen that when the simulation is sufficiently long, the original image can almost be reconstructed with the
-superimposed images composed of spikes obtained by the Poisson encoder.
+It can be seen that when the simulation is sufficiently long, the original image can almost be reconstructed with the superimposed images composed of spikes obtained by the Poisson encoder.
 
 Periodic Encoder
 -----------------
 
-Periodic encoder :class:`spikingjelly.clock_driven.encoding.PoissonEncoder` is an encoder that periodically outputs spikes
-from a given spike sequence. ``spike`` is set at the initialization of ``PeriodicEncoder``, and we can also use :class:`spikingjelly.clock_driven.encoding.PoissonEncoder.encode` to set a new ``spike``.
+Periodic encoder :class:`spikingjelly.clock_driven.encoding.PeriodicEncoder` is an encoder that periodically outputs spikes from a given spike sequence. ``spike`` is set at the initialization of ``PeriodicEncoder``, and we can also use :class:`spikingjelly.clock_driven.encoding.PeriodicEncoder.encode` to set a new ``spike``.
 
 .. code-block:: python
 
@@ -138,8 +123,7 @@ from a given spike sequence. ``spike`` is set at the initialization of ``Periodi
             self.spike = spike
             self.T = spike.shape[0]
 
-Example: Considering three neurons and spike sequences with 5 time steps, which are ``01000``, ``10000``, and ``00001`` respectively,
-we initialize a periodic encoder and output simulated spike data with 20 time steps.
+Example: Considering three neurons and spike sequences with 5 time steps, which are ``01000``, ``10000``, and ``00001`` respectively, we initialize a periodic encoder and output simulated spike data with 20 time steps.
 
 .. code-block:: python
 
@@ -165,12 +149,9 @@ we initialize a periodic encoder and output simulated spike data with 20 time st
 Latency encoder
 -------------------
 
-The latency encoder :class:`spikingjelly.clock_driven.encoding.LatencyEncoder` is an encoder that delays the delivery of spikes based on the input data ``x``. When the stimulus intensity is greater, the firing time is earlier, and there is a maximum spike latency.
-Therefore, for each input data ``x``, a spike sequence with a period of the maximum spike latency can be
-obtained.
+The latency encoder :class:`spikingjelly.clock_driven.encoding.LatencyEncoder` is an encoder that delays the delivery of spikes based on the input data ``x``. When the stimulus intensity is greater, the firing time is earlier, and there is a maximum spike latency. Therefore, for each input data ``x``, a spike sequence with a period of the maximum spike latency can be obtained.
 
-The spike firing time :math:`t_f` and the stimulus intensity :math:`x \in [0, 1]` satisfy the following formulas. When the encoding type is
-linear (``function_type='linear'``)
+The spike firing time :math:`t_f` and the stimulus intensity :math:`x \in [0, 1]` satisfy the following formulas. When the encoding type is linear (``function_type='linear'``)
 
 .. math::
     t_f(x) = (T - 1)(1 - x)
@@ -194,8 +175,7 @@ This may cause the encoder to overflow:
 
 because :math:`\alpha` will increase exponentially as :math:`T` increases.
 
-Example: Randomly generate six ``x``, each of which is the stimulation intensity of 6 neurons, and set the maximum spike
-latency to 20, then use ``LatencyEncoder`` to encode the above input data.
+Example: Randomly generate six ``x``, each of which is the stimulation intensity of 6 neurons, and set the maximum spike latency to 20, then use ``LatencyEncoder`` to encode the above input data.
 
 .. code-block:: python
 
@@ -222,8 +202,7 @@ latency to 20, then use ``LatencyEncoder`` to encode the above input data.
                                plot_firing_rate=False)
     plt.show()
 
-When the randomly generated stimulus intensities are ``0.6650``, ``0.3704``, ``0.8485``, ``0.0247``, ``0.5589``, and ``0.1030``, the spike
-sequence obtained is as follows:
+When the randomly generated stimulus intensities are ``0.6650``, ``0.3704``, ``0.8485``, ``0.0247``, ``0.5589``, and ``0.1030``, the spike sequence obtained is as follows:
 
 .. image:: ../_static/tutorials/clock_driven/2_encoding/2.*
     :width: 100%

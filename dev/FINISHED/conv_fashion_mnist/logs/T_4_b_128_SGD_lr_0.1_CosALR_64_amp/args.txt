@@ -1,0 +1,1 @@
+Namespace(T=4, T_max=64, amp=True, b=128, cupy=False, data_dir='/data/piaoqy/Datasets/snn_ds/install', device='cuda:0', epochs=64, gamma=0.1, j=4, lr=0.1, lr_scheduler='CosALR', momentum=0.9, opt='SGD', out_dir='./logs', resume=None, step_size=32)
