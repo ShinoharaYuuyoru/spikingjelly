@@ -1,9 +1,10 @@
 try:
+    import math
     import cupy
     import torch
     import torch.nn.functional as F
-    from . import cu_kernel_opt, surrogate
-    from ..configure import cuda_threads, cuda_compiler_options, cuda_compiler_backend
+    from . import cu_kernel_opt, surrogate, tensor_cache
+    from .. import configure
     import numpy as np
         
 
@@ -110,7 +111,7 @@ try:
             else:
                 raise TypeError
 
-            return cupy.RawKernel(code, kernel_name, options=cuda_compiler_options, backend=cuda_compiler_backend)
+            return cupy.RawKernel(code, kernel_name, options=configure.cuda_compiler_options, backend=configure.cuda_compiler_backend)
 
         @staticmethod
         def create_bptt_kernel(sg_cuda_code_fun, hard_reset: bool, detach_reset: bool, dtype: str):
@@ -168,7 +169,7 @@ try:
                     // grad_h = fmaf(grad_spike_seq[t], grad_s_to_h, (grad_v_seq[t] + grad_h) * grad_v_to_h);
                     grad_x_seq[t] = grad_h;
                     }
-                grad_v_last[index] = grad_x_seq[index];
+                grad_v_last[index] = grad_h;
                 }
                 }
                 '''
@@ -230,13 +231,13 @@ try:
                         grad_h = __hfma2(__hadd2(grad_v_seq[t], grad_h), grad_v_to_h, __hmul2(grad_spike_seq[t], grad_s_to_h));
                         grad_x_seq[t] = grad_h;
                         }
-                grad_v_last[index] = grad_x_seq[index];
+                grad_v_last[index] = grad_h;
                 }
                 }
                 '''
             else:
                 raise TypeError
-            return cupy.RawKernel(code, kernel_name, options=cuda_compiler_options, backend=cuda_compiler_backend)
+            return cupy.RawKernel(code, kernel_name, options=configure.cuda_compiler_options, backend=configure.cuda_compiler_backend)
 
         @staticmethod
         def forward(ctx, x_seq: torch.Tensor, v_last: torch.Tensor, v_threshold: float, v_reset: float,
@@ -260,9 +261,9 @@ try:
                 x_seq = F.pad(x_seq, (0, 1))  # [T, N] -> [T, N + 1]
                 v_last = F.pad(v_last, (0, 1))  # [N] -> [N + 1]
 
-            v_seq = torch.zeros_like(x_seq.data)
-            h_seq = torch.zeros_like(x_seq.data)
-            spike_seq = torch.zeros_like(x_seq.data)
+            zero_shape = list(x_seq.shape)
+            zero_shape[0] *= 3
+            v_seq, h_seq, spike_seq = torch.split(torch.zeros(zero_shape, device=x_seq.device, dtype=x_seq.dtype), x_seq.shape[0])
 
             v_v_seq = torch.cat((v_last.unsqueeze(0), v_seq))
 
@@ -270,7 +271,7 @@ try:
                 numel = x_seq.numel()
                 neuron_num = numel // x_seq.shape[0]
 
-                threads = cuda_threads
+                threads = configure.cuda_threads
                 if dtype == 'fp16':
                     assert neuron_num % 2 == 0
                     blocks = cu_kernel_opt.cal_blocks(neuron_num >> 1)
@@ -306,7 +307,12 @@ try:
 
             if requires_grad:
                 ctx.use_pad = use_pad
-                ctx.save_for_backward(h_seq, spike_seq)
+                if configure.save_spike_as_bool_in_neuron_kernel:
+                    ctx.s_shape = spike_seq.shape
+                    ctx.s_tk = tensor_cache.BOOL_TENSOR_CACHE.store_bool(spike_seq)
+                    ctx.save_for_backward(h_seq)
+                else:
+                    ctx.save_for_backward(h_seq, spike_seq)
                 ctx.blocks = blocks
                 ctx.threads = threads
                 ctx.cp_numel = cp_numel
@@ -332,9 +338,19 @@ try:
                 grad_v_seq = F.pad(grad_v_seq, (0, 1))
 
             device = grad_spike_seq.get_device()
-            h_seq, spike_seq = ctx.saved_tensors
-            grad_x_seq = torch.zeros_like(grad_spike_seq)
-            grad_v_last = torch.zeros_like(grad_spike_seq[0])
+
+            if configure.save_spike_as_bool_in_neuron_kernel:
+                h_seq = ctx.saved_tensors[0]
+                spike_seq = tensor_cache.BOOL_TENSOR_CACHE.get_float(ctx.s_tk, ctx.s_shape)
+            else:
+                h_seq, spike_seq = ctx.saved_tensors
+
+            zero_shape = list(grad_spike_seq.shape)
+            zero_shape[0] += 1
+            zero_data = torch.zeros(zero_shape, device=grad_spike_seq.device, dtype=grad_spike_seq.dtype)
+            grad_x_seq = zero_data[0: -1]
+            grad_v_last = zero_data[-1]
+
 
             if ctx.cp_v_reset is None:
                 hard_reset = False
@@ -380,8 +396,8 @@ try:
 
     class MultiStepLIFNodePTT(torch.autograd.Function):
         @staticmethod
-        def create_fptt_kernel(hard_reset: bool, dtype: str, kernel_name_prefix: str = 'LIFNode'):
-            kernel_name = f'{kernel_name_prefix}_fptt_{"hard" if hard_reset else "soft"}Reset_{dtype}'
+        def create_fptt_kernel(decay_input: bool, hard_reset: bool, dtype: str, kernel_name_prefix: str = 'LIFNode'):
+            kernel_name = f'{kernel_name_prefix}_fptt_decayInput{decay_input}_{"hard" if hard_reset else "soft"}Reset_{dtype}'
 
             if dtype == 'fp32':
                 code = rf'''
@@ -403,8 +419,15 @@ try:
                 '''
 
                 if hard_reset:
+                    if decay_input:
+                        code += r'''
+                            h_seq[t] = v_v_seq[t] + reciprocal_tau * (x_seq[t] - v_v_seq[t] + v_reset);
+                        '''
+                    else:
+                        code += r'''
+                            h_seq[t] = v_v_seq[t] - reciprocal_tau * (v_v_seq[t] - v_reset) + x_seq[t];
+                        '''
                     code += r'''
-                        h_seq[t] = v_v_seq[t] + reciprocal_tau * (x_seq[t] - v_v_seq[t] + v_reset);
                         if (h_seq[t] >= v_threshold)
                         {
                             spike_seq[t] = 1.0f;
@@ -412,8 +435,15 @@ try:
                         }
                     '''
                 else:
+                    if decay_input:
+                        code += r'''
+                            h_seq[t] = v_v_seq[t] + reciprocal_tau * (x_seq[t] - v_v_seq[t]);
+                        '''
+                    else:
+                        code += r'''
+                            h_seq[t] = v_v_seq[t] * (1.0f - reciprocal_tau) + x_seq[t];
+                        '''
                     code += r'''
-                        h_seq[t] = v_v_seq[t] + reciprocal_tau * (x_seq[t] - v_v_seq[t]);
                         if (h_seq[t] >= v_threshold)
                         {
                             spike_seq[t] = 1.0f;
@@ -465,14 +495,31 @@ try:
                         const int t = index + mem_offset;
                 '''
                 if hard_reset:
+                    if decay_input:
+                        code += r'''
+                            h_seq[t] = __hfma2(__hadd2(__hsub2(x_seq[t], v_v_seq[t]), v_reset_half2), reciprocal_tau_half2, v_v_seq[t]);
+                        '''
+                    else:
+                        code += r'''
+                            // h_seq[t] = v_v_seq[t] - reciprocal_tau * (v_v_seq[t] - v_reset) + x_seq[t];
+                            // = reciprocal_tau * (v_reset - v_v_seq[t]) + v_v_seq[t] + x_seq[t];
+                            h_seq[t] = __hadd2(__hfma2(__hsub2(v_reset_half2,  v_v_seq[t]), reciprocal_tau_half2, v_v_seq[t]), x_seq[t]);
+                        '''
                     code += r'''
-                        h_seq[t] = __hfma2(__hadd2(__hsub2(x_seq[t], v_v_seq[t]), v_reset_half2), reciprocal_tau_half2, v_v_seq[t]);
                         spike_seq[t] = __hgeu2(h_seq[t], v_threshold_half2);
                         v_v_seq[t + stride] = __hadd2(__hmul2(spike_seq[t], v_reset_half2), __hmul2(__hsub2(__float2half2_rn(1.0f), spike_seq[t]), h_seq[t]));
                     '''
                 else:
+                    if decay_input:
+                        code += r'''
+                            h_seq[t] = __hfma2(__hsub2(x_seq[t], v_v_seq[t]), reciprocal_tau_half2, v_v_seq[t]);
+                        '''
+                    else:
+                        code += r'''
+                            // h_seq[t] = v_v_seq[t] * (1.0f - reciprocal_tau) + x_seq[t];
+                            h_seq[t] = __hfma2(__hsub2(__float2half2_rn(1.0f), reciprocal_tau_half2), v_v_seq[t], x_seq[t]);
+                        '''
                     code += r'''
-                        h_seq[t] = __hfma2(__hsub2(x_seq[t], v_v_seq[t]), reciprocal_tau_half2, v_v_seq[t]);
                         spike_seq[t] = __hgeu2(h_seq[t], v_threshold_half2);
                         v_v_seq[t + stride] = __hadd2(__hmul2(spike_seq[t], __hsub2(h_seq[t], v_threshold_half2)), __hmul2(__hsub2(__float2half2_rn(1.0f), spike_seq[t]), h_seq[t]));
                     '''
@@ -484,13 +531,12 @@ try:
                 '''
             else:
                 raise TypeError
-
-            return cupy.RawKernel(code, kernel_name, options=cuda_compiler_options, backend=cuda_compiler_backend)
+            return cupy.RawKernel(code, kernel_name, options=configure.cuda_compiler_options, backend=configure.cuda_compiler_backend)
 
         @staticmethod
-        def create_bptt_kernel(sg_cuda_code_fun, hard_reset: bool, detach_reset: bool, dtype: str):
+        def create_bptt_kernel(sg_cuda_code_fun, decay_input: bool, hard_reset: bool, detach_reset: bool, dtype: str):
 
-            kernel_name = f'LIFNode_bptt_{"hard" if hard_reset else "soft"}Reset_{"detachReset" if detach_reset else ""}_{dtype}'
+            kernel_name = f'LIFNode_bptt_decayInput{decay_input}_{"hard" if hard_reset else "soft"}Reset_{"detachReset" if detach_reset else ""}_{dtype}'
 
             code_grad_s_to_h = sg_cuda_code_fun(x='over_th', y='grad_s_to_h', dtype=dtype)
 
@@ -542,9 +588,18 @@ try:
                 code += r'''
                     grad_h = grad_spike_seq[t] * grad_s_to_h + (grad_v_seq[t] + grad_h * one_sub_reciprocal_tau) * grad_v_to_h;
                     // grad_h = fmaf(grad_spike_seq[t], grad_s_to_h, fmaf(grad_h, one_sub_reciprocal_tau, grad_v_seq[t]) * grad_v_to_h);
-                    grad_x_seq[t] = grad_h * reciprocal_tau;
+                '''
+                if decay_input:
+                    code += r'''
+                        grad_x_seq[t] = grad_h * reciprocal_tau;
+                    '''
+                else:
+                    code += r'''
+                        grad_x_seq[t] = grad_h;
+                    '''
+                code += r'''
                     }
-                grad_v_last[index] = grad_x_seq[index] * one_sub_reciprocal_tau;
+                grad_v_last[index] = grad_h * one_sub_reciprocal_tau;
                 }
                 }
                 '''
@@ -609,19 +664,28 @@ try:
                 code += code_grad_v_to_h
                 code += r'''                        
                         grad_h = __hfma2(__hfma2(grad_h, one_sub_reciprocal_tau_half2, grad_v_seq[t]), grad_v_to_h, __hmul2(grad_spike_seq[t], grad_s_to_h));
-                        grad_x_seq[t] = __hmul2(grad_h, reciprocal_tau_half2);
+                '''
+                if decay_input:
+                    code += r''' 
+                            grad_x_seq[t] = __hmul2(grad_h, reciprocal_tau_half2);
+                    '''
+                else:
+                    code += r''' 
+                            grad_x_seq[t] = grad_h;
+                    '''
+                code += r'''
                     }
-                grad_v_last[index] = __hmul2(grad_x_seq[index], one_sub_reciprocal_tau_half2);
+                grad_v_last[index] = __hmul2(grad_h, one_sub_reciprocal_tau_half2);
                 }
                 }
                 '''
 
             else:
                 raise TypeError
-            return cupy.RawKernel(code, kernel_name, options=cuda_compiler_options, backend=cuda_compiler_backend)
+            return cupy.RawKernel(code, kernel_name, options=configure.cuda_compiler_options, backend=configure.cuda_compiler_backend)
 
         @staticmethod
-        def forward(ctx, x_seq: torch.Tensor, v_last: torch.Tensor, tau: float, v_threshold: float, v_reset: float,
+        def forward(ctx, x_seq: torch.Tensor, v_last: torch.Tensor, decay_input: bool, tau: float, v_threshold: float, v_reset: float,
                     detach_reset: bool, sg_cuda_code_fun):
             requires_grad = x_seq.requires_grad or v_last.requires_grad
             device = x_seq.get_device()
@@ -642,9 +706,9 @@ try:
                 x_seq = F.pad(x_seq, (0, 1))  # [T, N] -> [T, N + 1]
                 v_last = F.pad(v_last, (0, 1))  # [N] -> [N + 1]
 
-            v_seq = torch.zeros_like(x_seq.data)
-            h_seq = torch.zeros_like(x_seq.data)
-            spike_seq = torch.zeros_like(x_seq.data)
+            zero_shape = list(x_seq.shape)
+            zero_shape[0] *= 3
+            v_seq, h_seq, spike_seq = torch.split(torch.zeros(zero_shape, device=x_seq.device, dtype=x_seq.dtype), x_seq.shape[0])
 
             v_v_seq = torch.cat((v_last.unsqueeze(0), v_seq))
 
@@ -652,7 +716,7 @@ try:
                 numel = x_seq.numel()
                 neuron_num = numel // x_seq.shape[0]
 
-                threads = cuda_threads
+                threads = configure.cuda_threads
                 if dtype == 'fp16':
                     assert neuron_num % 2 == 0
                     blocks = cu_kernel_opt.cal_blocks(neuron_num >> 1)
@@ -682,8 +746,7 @@ try:
                     kernel_args = [x_seq, v_v_seq, h_seq, spike_seq, cp_reciprocal_tau, cp_v_threshold, cp_v_reset,
                                    cp_neuron_num, cp_numel]
 
-                kernel = MultiStepLIFNodePTT.create_fptt_kernel(hard_reset, dtype)
-
+                kernel = MultiStepLIFNodePTT.create_fptt_kernel(decay_input, hard_reset, dtype)
                 kernel(
                     (blocks,), (threads,),
                     cu_kernel_opt.wrap_args_to_raw_kernel(
@@ -693,8 +756,14 @@ try:
                 )
 
             if requires_grad:
+                ctx.decay_input = decay_input
                 ctx.use_pad = use_pad
-                ctx.save_for_backward(h_seq, spike_seq)
+                if configure.save_spike_as_bool_in_neuron_kernel:
+                    ctx.s_shape = spike_seq.shape
+                    ctx.s_tk = tensor_cache.BOOL_TENSOR_CACHE.store_bool(spike_seq)
+                    ctx.save_for_backward(h_seq)
+                else:
+                    ctx.save_for_backward(h_seq, spike_seq)
                 ctx.blocks = blocks
                 ctx.threads = threads
                 ctx.cp_numel = cp_numel
@@ -722,9 +791,16 @@ try:
                 grad_v_seq = F.pad(grad_v_seq, (0, 1))
 
             device = grad_spike_seq.get_device()
-            h_seq, spike_seq = ctx.saved_tensors
-            grad_x_seq = torch.zeros_like(grad_spike_seq)
-            grad_v_last = torch.zeros_like(grad_spike_seq[0])
+            if configure.save_spike_as_bool_in_neuron_kernel:
+                h_seq = ctx.saved_tensors[0]
+                spike_seq = tensor_cache.BOOL_TENSOR_CACHE.get_float(ctx.s_tk, ctx.s_shape)
+            else:
+                h_seq, spike_seq = ctx.saved_tensors
+            zero_shape = list(grad_spike_seq.shape)
+            zero_shape[0] += 1
+            zero_data = torch.zeros(zero_shape, device=grad_spike_seq.device, dtype=grad_spike_seq.dtype)
+            grad_x_seq = zero_data[0: -1]
+            grad_v_last = zero_data[-1]
 
             if ctx.cp_v_reset is None:
                 hard_reset = False
@@ -738,7 +814,7 @@ try:
             else:
                 raise NotImplementedError
 
-            kernel = MultiStepLIFNodePTT.create_bptt_kernel(ctx.sg_cuda_code_fun, hard_reset, ctx.detach_reset, dtype)
+            kernel = MultiStepLIFNodePTT.create_bptt_kernel(ctx.sg_cuda_code_fun, ctx.decay_input, hard_reset, ctx.detach_reset, dtype)
 
             with cupy.cuda.Device(device):
 
@@ -766,20 +842,19 @@ try:
                     )
                 )
             if ctx.use_pad:
-                return grad_x_seq[..., :-1], grad_v_last[..., :-1], None, None, None, None, None
+                return grad_x_seq[..., :-1], grad_v_last[..., :-1], None, None, None, None, None, None
             else:
-                return grad_x_seq, grad_v_last, None, None, None, None, None
+                return grad_x_seq, grad_v_last, None, None, None, None, None, None
 
 
     class MultiStepParametricLIFNodePTT(torch.autograd.Function):
         @staticmethod
-        def create_fptt_kernel(hard_reset: bool, dtype: str):
-            return MultiStepLIFNodePTT.create_fptt_kernel(hard_reset, dtype, kernel_name_prefix='ParametricLIFNode')
+        def create_fptt_kernel(decay_input: bool, hard_reset: bool, dtype: str):
+            return MultiStepLIFNodePTT.create_fptt_kernel(decay_input, hard_reset, dtype, kernel_name_prefix='ParametricLIFNode')
 
         @staticmethod
-        def create_bptt_kernel(sg_cuda_code_fun, hard_reset: bool, detach_reset: bool, dtype: str):
-
-            kernel_name = f'ParametricLIFNode_bptt_{"hard" if hard_reset else "soft"}Reset_{"detachReset" if detach_reset else ""}_{dtype}'
+        def create_bptt_kernel(sg_cuda_code_fun, decay_input: bool, hard_reset: bool, detach_reset: bool, dtype: str):
+            kernel_name = f'ParametricLIFNode_bptt_decayInput{decay_input}_{"hard" if hard_reset else "soft"}Reset_{"detachReset" if detach_reset else ""}_{dtype}'
 
             code_grad_s_to_h = sg_cuda_code_fun(x='over_th', y='grad_s_to_h', dtype=dtype)
 
@@ -797,7 +872,7 @@ try:
                 {
                     const int index = blockIdx.x * blockDim.x + threadIdx.x;
                 '''
-                code += f'__shared__ float sdata[{cuda_threads}];'
+                code += f'__shared__ float sdata[{configure.cuda_threads}];'
                 code += r'''
                     if (index < neuron_num)
                     {   
@@ -834,10 +909,26 @@ try:
                 code += r'''
                     grad_h = grad_spike_seq[t] * grad_s_to_h + (grad_v_seq[t] + grad_h * one_sub_reciprocal_tau) * grad_v_to_h;
                     // grad_h = fmaf(grad_spike_seq[t], grad_s_to_h, fmaf(grad_h, one_sub_reciprocal_tau, grad_v_seq[t]) * grad_v_to_h);
-                    grad_x_seq[t] = grad_h * reciprocal_tau;
-                    sdata[threadIdx.x] += grad_h * (h_seq[t] - v_v_seq[t]) / reciprocal_tau;
+                '''
+                if decay_input:
+                    code += r'''
+                        grad_x_seq[t] = grad_h * reciprocal_tau;
+                        sdata[threadIdx.x] += grad_h * (h_seq[t] - v_v_seq[t]) / reciprocal_tau;
+                    '''
+                else:
+                    if hard_reset:
+                        code += r'''
+                            grad_x_seq[t] = grad_h;
+                            sdata[threadIdx.x] += grad_h * (v_reset - v_v_seq[t]);
+                        '''
+                    else:
+                        code += r'''
+                            grad_x_seq[t] = grad_h;
+                            sdata[threadIdx.x] -= grad_h * v_v_seq[t];
+                        '''
+                code += r'''
                     }
-                grad_v_last[index] = grad_x_seq[index] * one_sub_reciprocal_tau;
+                grad_v_last[index] = grad_h * one_sub_reciprocal_tau;
                 }
                 else
                 {
@@ -857,7 +948,7 @@ try:
                 __syncthreads();
                 if (threadIdx.x == 0)
                 {
-                grad_reciprocal_tau[0] = sdata[0];
+                atomicAdd(grad_reciprocal_tau, sdata[0]);
                 }
                 }
                 '''
@@ -868,10 +959,11 @@ try:
                 extern "C" __global__
                 void {kernel_name}(
                 const half2* grad_spike_seq, const half2* grad_v_seq, const half2* h_seq, const half2* spike_seq, const half2* v_v_seq,
-                half2* grad_x_seq, half2* grad_v_last,  half* grad_reciprocal_tau,
+                half2* grad_x_seq, half2* grad_v_last,  float* grad_reciprocal_tau,
                 const half & reciprocal_tau, const half & one_sub_reciprocal_tau,
                 const half & v_threshold, {'const half & v_reset,' if hard_reset else ''}
-                const int & neuron_num, const int & numel)
+                const int & neuron_num, const int & numel)\
+                // note that grad_reciprocal_tau is float to avoid overflow
                 '''
                 code += r'''
                 {
@@ -879,7 +971,7 @@ try:
                 const int stride = neuron_num >> 1;
 
                 '''
-                code += f'__shared__ half2 sdata[{cuda_threads}];'
+                code += f'__shared__ float sdata[{configure.cuda_threads}];'
                 code += r'''
                 if (index < stride)
                 {   
@@ -896,7 +988,7 @@ try:
                 code += r'''
 
                     half2 grad_h = __float2half2_rn(0.0f);  // grad_h will be used recursively
-                    sdata[threadIdx.x] = __float2half2_rn(0.0f);
+                    sdata[threadIdx.x] = 0.0f;
                     for(int mem_offset = (numel >> 1) - stride; mem_offset >= 0; mem_offset -= stride)
                     {
                         const int t = index + mem_offset;
@@ -928,43 +1020,74 @@ try:
                 code += code_grad_v_to_h
                 code += r'''                        
                         grad_h = __hfma2(__hfma2(grad_h, one_sub_reciprocal_tau_half2, grad_v_seq[t]), grad_v_to_h, __hmul2(grad_spike_seq[t], grad_s_to_h));
-                        grad_x_seq[t] = __hmul2(grad_h, reciprocal_tau_half2);
-                        sdata[threadIdx.x] = __hadd2(__h2div(__hmul2(grad_h, __hsub2(h_seq[t], v_v_seq[t])), reciprocal_tau_half2), sdata[threadIdx.x]);
+                '''
+                if decay_input:
+                    code += r'''  
+                            grad_x_seq[t] = __hmul2(grad_h, reciprocal_tau_half2);
+                            half2 temp_sum = __h2div(__hmul2(grad_h, __hsub2(h_seq[t], v_v_seq[t])), reciprocal_tau_half2);
+                            sdata[threadIdx.x] += __half2float(__hadd(__low2half(temp_sum), __high2half(temp_sum)));
+                    '''
+                else:
+                    if hard_reset:
+                        code += r'''  
+                                grad_x_seq[t] = grad_h;
+                                half2 temp_sum = __hmul2(grad_h, __hsub2(v_reset_half2, v_v_seq[t]));
+                                sdata[threadIdx.x] += __half2float(__hadd(__low2half(temp_sum), __high2half(temp_sum)));
+                        '''
+                    else:
+                        code += r'''  
+                                grad_x_seq[t] = grad_h;
+                                half2 temp_sum = __hmul2(grad_h, __hneg2(v_v_seq[t]));
+                                sdata[threadIdx.x] += __half2float(__hadd(__low2half(temp_sum), __high2half(temp_sum)));
+                        '''
+                code += r'''  
                     }
-
-                grad_v_last[index] = __hmul2(grad_x_seq[index], one_sub_reciprocal_tau_half2);
+                grad_v_last[index] = __hmul2(grad_h, one_sub_reciprocal_tau_half2);
                 }
                 else
                 {
-                    sdata[threadIdx.x] = __float2half2_rn(0.0f);
+                    sdata[threadIdx.x] = 0.0f;
                 }
                 int threadx = blockDim.x;
                 #pragma unroll
-                for (int stride = threadx >> 1; stride > 0; stride = stride >> 1)
+                for (int i = threadx >> 1; i > 0; i = i >> 1)
                 {
                 // Synchronize all thread before next loop
                 __syncthreads();
-                if (threadIdx.x < stride)
+                if (threadIdx.x < i)
                 {
-                  sdata[threadIdx.x] = __hadd2(sdata[threadIdx.x], sdata[threadIdx.x + stride]);
+                  sdata[threadIdx.x] += sdata[threadIdx.x + i];
                 }
                 }
                 __syncthreads();
                 if (threadIdx.x == 0)
-                {
-                grad_reciprocal_tau[0] = __hadd(__low2half(sdata[0]), __high2half(sdata[0]));
+                {                
+                /*
+                The 32-bit floating-point version of atomicAdd() is only supported by devices of compute capability 2.x and higher.
+
+                The 64-bit floating-point version of atomicAdd() is only supported by devices of compute capability 6.x and higher.
+                
+                The 32-bit __half2 floating-point version of atomicAdd() is only supported by devices of compute capability 6.x and higher. The atomicity of the __half2 or __nv_bfloat162 add operation is guaranteed separately for each of the two __half or __nv_bfloat16 elements; the entire __half2 or __nv_bfloat162 is not guaranteed to be atomic as a single 32-bit access.
+                
+                The 16-bit __half floating-point version of atomicAdd() is only supported by devices of compute capability 7.x and higher.
+                
+                The 16-bit __nv_bfloat16 floating-point version of atomicAdd() is only supported by devices of compute capability 8.x and higher.
+                */
+                
+                atomicAdd(grad_reciprocal_tau, sdata[0]);
+                    
                 }
                 }
                 '''
-
             else:
                 raise TypeError
 
-            return cupy.RawKernel(code, kernel_name, options=cuda_compiler_options, backend=cuda_compiler_backend)
+            return cupy.RawKernel(code, kernel_name, options=configure.cuda_compiler_options, backend=configure.cuda_compiler_backend)
 
         @staticmethod
-        def forward(ctx, x_seq: torch.Tensor, v_last: torch.Tensor, reciprocal_tau: torch.Tensor, v_threshold: float,
+        def forward(ctx, x_seq: torch.Tensor, v_last: torch.Tensor, reciprocal_tau: torch.Tensor, decay_input: bool, v_threshold: float,
                     v_reset: float, detach_reset: bool, sg_cuda_code_fun):
+            # reciprocal_tau.dtype is float32 even when using amp
             requires_grad = x_seq.requires_grad or v_last.requires_grad
             device = x_seq.get_device()
             if x_seq.dtype == torch.float32:
@@ -973,6 +1096,8 @@ try:
             elif x_seq.dtype == torch.float16:
                 dtype = 'fp16'
                 cp_dtype = np.half
+                # assert torch.cuda.get_device_capability(device)[0] >= 7, "MultiStepParametricLIFNodePTT can not run in the current device with float16 because the 16-bit __half floating-point version of atomicAdd() is only supported by devices of compute capability 7.x and higher."
+
             else:
                 raise NotImplementedError
 
@@ -984,9 +1109,9 @@ try:
                 x_seq = F.pad(x_seq, (0, 1))  # [T, N] -> [T, N + 1]
                 v_last = F.pad(v_last, (0, 1))  # [N] -> [N + 1]
 
-            v_seq = torch.zeros_like(x_seq.data)
-            h_seq = torch.zeros_like(x_seq.data)
-            spike_seq = torch.zeros_like(x_seq.data)
+            zero_shape = list(x_seq.shape)
+            zero_shape[0] *= 3
+            v_seq, h_seq, spike_seq = torch.split(torch.zeros(zero_shape, device=x_seq.device, dtype=x_seq.dtype), x_seq.shape[0])
 
             v_v_seq = torch.cat((v_last.unsqueeze(0), v_seq))
             tau = 1. / reciprocal_tau.item()
@@ -995,7 +1120,7 @@ try:
                 numel = x_seq.numel()
                 neuron_num = numel // x_seq.shape[0]
 
-                threads = cuda_threads
+                threads = configure.cuda_threads
                 if dtype == 'fp16':
                     assert neuron_num % 2 == 0
                     blocks = cu_kernel_opt.cal_blocks(neuron_num >> 1)
@@ -1025,7 +1150,7 @@ try:
                     kernel_args = [x_seq, v_v_seq, h_seq, spike_seq, cp_reciprocal_tau, cp_v_threshold, cp_v_reset,
                                    cp_neuron_num, cp_numel]
 
-                kernel = MultiStepParametricLIFNodePTT.create_fptt_kernel(hard_reset, dtype)
+                kernel = MultiStepParametricLIFNodePTT.create_fptt_kernel(decay_input, hard_reset, dtype)
 
                 kernel(
                     (blocks,), (threads,),
@@ -1036,8 +1161,14 @@ try:
                 )
 
             if requires_grad:
+                ctx.decay_input = decay_input
                 ctx.use_pad = use_pad
-                ctx.save_for_backward(h_seq, spike_seq, v_v_seq)
+                if configure.save_spike_as_bool_in_neuron_kernel:
+                    ctx.s_shape = spike_seq.shape
+                    ctx.s_tk = tensor_cache.BOOL_TENSOR_CACHE.store_bool(spike_seq)
+                    ctx.save_for_backward(h_seq, v_v_seq)
+                else:
+                    ctx.save_for_backward(h_seq, spike_seq, v_v_seq)
                 ctx.blocks = blocks
                 ctx.threads = threads
                 ctx.cp_numel = cp_numel
@@ -1065,10 +1196,17 @@ try:
                 grad_v_seq = F.pad(grad_v_seq, (0, 1))
 
             device = grad_spike_seq.get_device()
-            h_seq, spike_seq, v_v_seq = ctx.saved_tensors
-            grad_x_seq = torch.zeros_like(grad_spike_seq)
-            grad_v_last = torch.zeros_like(grad_spike_seq[0])
-            grad_reciprocal_tau = torch.as_tensor(0.).to(grad_spike_seq)
+            if configure.save_spike_as_bool_in_neuron_kernel:
+                spike_seq = tensor_cache.BOOL_TENSOR_CACHE.get_float(ctx.s_tk, ctx.s_shape)
+                h_seq, v_v_seq = ctx.saved_tensors
+            else:
+                h_seq, spike_seq, v_v_seq = ctx.saved_tensors
+            zero_shape = list(grad_spike_seq.shape)
+            zero_shape[0] += 1
+            zero_data = torch.zeros(zero_shape, device=grad_spike_seq.device, dtype=grad_spike_seq.dtype)
+            grad_x_seq = zero_data[0: -1]
+            grad_v_last = zero_data[-1]
+            grad_reciprocal_tau = torch.as_tensor(0., device=grad_spike_seq.device, dtype=torch.float32)
 
             if ctx.cp_v_reset is None:
                 hard_reset = False
@@ -1082,7 +1220,7 @@ try:
             else:
                 raise NotImplementedError
 
-            kernel = MultiStepParametricLIFNodePTT.create_bptt_kernel(ctx.sg_cuda_code_fun, hard_reset,
+            kernel = MultiStepParametricLIFNodePTT.create_bptt_kernel(ctx.sg_cuda_code_fun, ctx.decay_input, hard_reset,
                                                                       ctx.detach_reset, dtype)
 
             with cupy.cuda.Device(device):
@@ -1113,12 +1251,12 @@ try:
                 )
 
             if ctx.use_pad:
-                return grad_x_seq[..., :-1], grad_v_last[..., :-1], grad_reciprocal_tau, None, None, None, None
+                return grad_x_seq[..., :-1], grad_v_last[..., :-1], grad_reciprocal_tau, None, None, None, None, None
             else:
-                return grad_x_seq, grad_v_last, grad_reciprocal_tau, None, None, None, None
+                return grad_x_seq, grad_v_last, grad_reciprocal_tau, None, None, None, None, None
 
 
-    def check_multi_step_neuron_output_and_grad(device, multi_step_neuron, *neu_args, **neu_kwargs):
+    def check_multi_step_neuron_output_and_grad(device, multi_step_neuron, shape = [65, 15, 511], *neu_args, **neu_kwargs):
         @torch.no_grad()
         def max_error(x, y):
             return (x - y).abs().max().item()
@@ -1126,10 +1264,10 @@ try:
         def fbptt(m, x: torch.Tensor):
             x = x.detach()
             x.requires_grad_(True)
-            m(x)
-            (m.spike_seq * m.v_seq ** 2).sum().backward()
+            spike_seq = m(x)
+            (spike_seq * m.v_seq ** 2).sum().backward()
             ret = {
-                'spike_seq': m.spike_seq.detach().clone(),
+                'spike_seq': spike_seq.detach().clone(),
                 'v_seq': m.v_seq.detach().clone(),
                 'x.grad': x.grad.clone()
             }
@@ -1140,7 +1278,6 @@ try:
             m.reset()
             return ret
 
-        shape = [65, 15, 7]
         for hard_reset in [True, False]:
             for detach_reset in [False, True]:
                 for dtype in ['fp32', 'fp16']:
@@ -1152,6 +1289,8 @@ try:
                                               **neu_kwargs)
                     # print(model)
                     model.to(device)
+                    if dtype == 'fp16':
+                        model = model.half()
                     model.backend = 'torch'
                     y_torch = fbptt(model, x)
 
@@ -1159,30 +1298,11 @@ try:
                     y_cupy = fbptt(model, x)
 
                     for key in y_torch.keys():
-                        print(key, 'max error', max_error(y_torch[key], y_cupy[key]))
+                        me = max_error(y_torch[key], y_cupy[key])
+                        print(key, 'max error', me)
+                        if me > 0.5:
+                            print(f'y_torch[{key}]={y_torch[key]}, y_cupy[{key}]={y_cupy[key]}')
                     print('\n')
-
-
-    def save_cuda_codes(cu_file_path: str = './spikingjelly/clock_driven/neuron_kernel.cu'):
-        # save all cuda codes to files
-        with open(cu_file_path, 'w+') as cu_file:
-            cu_file.write('// This file is created by spikingjelly.clock_driven.neuron_kernel.save_cuda_codes.\n')
-            for ms_neu in [MultiStepIFNodePTT, MultiStepLIFNodePTT, MultiStepParametricLIFNodePTT]:
-                cu_file.write('\n// ' + ms_neu.__name__ + '\n')
-                for sg in [surrogate.ATan, surrogate.Sigmoid, surrogate.PiecewiseLeakyReLU]:
-                    for hard_reset in [True, False]:
-                        for dtype in ['fp32', 'fp16']:
-                            cu_file.write(
-                                f'\n// {ms_neu.__name__} fptt {sg.__name__}, hard_reset={hard_reset}, dtype={dtype}\n')
-                            fp_codes = ms_neu.create_fptt_kernel(hard_reset, dtype).code
-                            cu_file.write(fp_codes)
-                            for detach_reset in [True, False]:
-                                cu_file.write(
-                                    f'\n// {ms_neu.__name__} bptt {sg.__name__}, hard_reset={hard_reset}, dtype={dtype}, detach_reset={detach_reset}\n')
-                                bp_codes = ms_neu.create_bptt_kernel(sg().cuda_code, hard_reset, detach_reset,
-                                                                     dtype).code
-                                cu_file.write(bp_codes)
-
 
     class MultiStepEIFNodePTT(torch.autograd.Function):
         @staticmethod
@@ -1295,7 +1415,7 @@ try:
             else:
                 raise TypeError
 
-            return cupy.RawKernel(code, kernel_name, options=cuda_compiler_options, backend=cuda_compiler_backend)
+            return cupy.RawKernel(code, kernel_name, options=configure.cuda_compiler_options, backend=configure.cuda_compiler_backend)
 
         @staticmethod
         def create_bptt_kernel(sg_cuda_code_fun, hard_reset: bool, detach_reset: bool, dtype: str):
@@ -1427,7 +1547,7 @@ try:
                 '''
             else:
                 raise TypeError
-            return cupy.RawKernel(code, kernel_name, options=cuda_compiler_options, backend=cuda_compiler_backend)
+            return cupy.RawKernel(code, kernel_name, options=configure.cuda_compiler_options, backend=configure.cuda_compiler_backend)
 
         @staticmethod
         def forward(ctx, x_seq: torch.Tensor, v_last: torch.Tensor, tau: float, v_threshold: float, v_reset: float, v_rest: float, theta_rh: float, delta_T: float, detach_reset: bool, sg_cuda_code_fun):
@@ -1450,9 +1570,9 @@ try:
                 x_seq = F.pad(x_seq, (0, 1))  # [T, N] -> [T, N + 1]
                 v_last = F.pad(v_last, (0, 1))  # [N] -> [N + 1]
 
-            v_seq = torch.zeros_like(x_seq.data)
-            h_seq = torch.zeros_like(x_seq.data)
-            spike_seq = torch.zeros_like(x_seq.data)
+            zero_shape = list(x_seq.shape)
+            zero_shape[0] *= 3
+            v_seq, h_seq, spike_seq = torch.split(torch.zeros(zero_shape, device=x_seq.device, dtype=x_seq.dtype), x_seq.shape[0])
 
             v_v_seq = torch.cat((v_last.unsqueeze(0), v_seq))
 
@@ -1460,7 +1580,7 @@ try:
                 numel = x_seq.numel()
                 neuron_num = numel // x_seq.shape[0]
 
-                threads = cuda_threads
+                threads = configure.cuda_threads
                 if dtype == 'fp16':
                     assert neuron_num % 2 == 0
                     blocks = cu_kernel_opt.cal_blocks(neuron_num >> 1)
@@ -1502,7 +1622,12 @@ try:
 
             if requires_grad:
                 ctx.use_pad = use_pad
-                ctx.save_for_backward(h_seq, spike_seq, v_v_seq)
+                if configure.save_spike_as_bool_in_neuron_kernel:
+                    ctx.s_shape = spike_seq.shape
+                    ctx.s_tk = tensor_cache.BOOL_TENSOR_CACHE.store_bool(spike_seq)
+                    ctx.save_for_backward(h_seq, v_v_seq)
+                else:
+                    ctx.save_for_backward(h_seq, spike_seq, v_v_seq)
                 ctx.blocks = blocks
                 ctx.threads = threads
                 ctx.cp_numel = cp_numel
@@ -1532,9 +1657,16 @@ try:
                 grad_v_seq = F.pad(grad_v_seq, (0, 1))
 
             device = grad_spike_seq.get_device()
-            h_seq, spike_seq, v_v_seq = ctx.saved_tensors
-            grad_x_seq = torch.zeros_like(grad_spike_seq)
-            grad_v_last = torch.zeros_like(grad_spike_seq[0])
+            if configure.save_spike_as_bool_in_neuron_kernel:
+                spike_seq = tensor_cache.BOOL_TENSOR_CACHE.get_float(ctx.s_tk, ctx.s_shape)
+                h_seq, v_v_seq = ctx.saved_tensors
+            else:
+                h_seq, spike_seq, v_v_seq = ctx.saved_tensors
+            zero_shape = list(grad_spike_seq.shape)
+            zero_shape[0] += 1
+            zero_data = torch.zeros(zero_shape, device=grad_spike_seq.device, dtype=grad_spike_seq.dtype)
+            grad_x_seq = zero_data[0: -1]
+            grad_v_last = zero_data[-1]
 
             if ctx.cp_v_reset is None:
                 hard_reset = False
@@ -1572,11 +1704,43 @@ try:
                 return grad_x_seq, grad_v_last, None, None, None, None, None, None, None, None
 
 
+    def save_cuda_codes(cu_file_path: str = './spikingjelly/clock_driven/neuron_kernel.cu'):
+        # save all cuda codes to files
+        with open(cu_file_path, 'w+') as cu_file:
+            cu_file.write('// This file is created by spikingjelly.clock_driven.neuron_kernel.save_cuda_codes.\n')
+            for ms_neu in [MultiStepIFNodePTT, MultiStepLIFNodePTT, MultiStepParametricLIFNodePTT, MultiStepEIFNodePTT]:
+                cu_file.write('\n// ' + ms_neu.__name__ + '\n')
+                for sg in [surrogate.ATan, surrogate.Sigmoid, surrogate.PiecewiseLeakyReLU]:
+                    for hard_reset in [True, False]:
+                        for dtype in ['fp32', 'fp16']:
+                            if ms_neu == MultiStepLIFNodePTT or ms_neu == MultiStepParametricLIFNodePTT:
+                                for decay_input in [True, False]:
+                                    cu_file.write(
+                                        f'\n// {ms_neu.__name__} fptt {sg.__name__}, decay_input={decay_input}, hard_reset={hard_reset}, dtype={dtype}\n')
+                                    fp_codes = ms_neu.create_fptt_kernel(decay_input, hard_reset, dtype).code
+                                    cu_file.write(fp_codes)
+                                    for detach_reset in [True, False]:
+                                        cu_file.write(
+                                            f'\n// {ms_neu.__name__} bptt {sg.__name__}, decay_input={decay_input}, hard_reset={hard_reset}, dtype={dtype}, detach_reset={detach_reset}\n')
+                                        bp_codes = ms_neu.create_bptt_kernel(sg().cuda_code, decay_input, hard_reset, detach_reset,
+                                                                             dtype).code
+                                        cu_file.write(bp_codes)
+                            else:
+                                cu_file.write(
+                                    f'\n// {ms_neu.__name__} fptt {sg.__name__}, hard_reset={hard_reset}, dtype={dtype}\n')
+                                fp_codes = ms_neu.create_fptt_kernel(hard_reset, dtype).code
+                                cu_file.write(fp_codes)
+                                for detach_reset in [True, False]:
+                                    cu_file.write(
+                                        f'\n// {ms_neu.__name__} bptt {sg.__name__}, hard_reset={hard_reset}, dtype={dtype}, detach_reset={detach_reset}\n')
+                                    bp_codes = ms_neu.create_bptt_kernel(sg().cuda_code, hard_reset, detach_reset,
+                                                                         dtype).code
+                                    cu_file.write(bp_codes)
 
 
 
-
-except ImportError:
+except BaseException as e:
+    print('spikingjelly.clock_driven.neuron_kernel:', e)
     pass
 
 

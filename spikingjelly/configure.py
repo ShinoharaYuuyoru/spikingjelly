@@ -1,7 +1,17 @@
-# This py file defines some variables used in SpikingJelly.
-# The user can change them and install SpikingJelly manually.
+'''
+This py file defines some variables used in SpikingJelly.
+Here is an example of how you can change them to make effect in your codes:
 
-max_threads_number_for_datasets_preprocess = 8
+    import spikingjelly
+    spikingjelly.configure.cuda_threads = 512
+
+Do not change them in this way, which will not make effect:
+
+    from spikingjelly.configure import cuda_threads
+    cuda_threads = 512
+
+'''
+max_threads_number_for_datasets_preprocess = 16
 '''
 `max_threads_number_for_datasets_preprocess` defines the maximum threads for datasets preprocessing, which is 
 1. reading binary events and saving them to numpy format
@@ -34,5 +44,26 @@ cuda_compiler_backend = 'nvrtc'
 It can be set to 'nvcc' or 'nvrtc'.
 '''
 
+save_datasets_compressed = True
+'''
+If `save_datasets_compressed == True`, events and frames in spikingjelly.datasets will be saved in compressed npz format.
 
+The compressed npz file consumes less memory in disk but more time in reading.
+'''
+
+save_spike_as_bool_in_neuron_kernel = False
+'''
+If `save_spike_as_bool_in_neuron_kernel == True`, the neuron kernel used in the neuron's cupy backend will save the spike as a bool, rather than float/half tensor for backward, which can reduce the memory consumption.
+'''
+
+save_bool_spike_level = 0
+'''
+`save_bool_spike_level` take effects on SpikeConv/SpikeLinear, and on neuron's cupy kernel when `save_spike_as_bool_in_neuron_kernel == True`.
+
+If `save_bool_spike_level == 0`, spikes will be saved in bool. Note that bool uses 8-bit, rather than 1-bit.
+
+If `save_bool_spike_level == 1`, spikes will be saved in uint8 with each 8-bit storing 8 spikes.
+
+A larger `save_bool_spike_level` means less memory consumption but slower speed.
+'''
 

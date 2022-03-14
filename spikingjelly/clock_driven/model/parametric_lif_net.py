@@ -15,9 +15,7 @@ class VotingLayer(nn.Module):
         self.voting_size = voting_size
 
     def forward(self, x: torch.Tensor):
-        x.unsqueeze_(1)  # [N, C] -> [N, 1, C]
-        y = F.avg_pool1d(x, self.voting_size, self.voting_size)
-        y.squeeze_(1)
+        y = F.avg_pool1d(x.unsqueeze(1), self.voting_size, self.voting_size).squeeze(1)
         return y
 
 
@@ -113,7 +111,7 @@ class MultiStepMNISTNet(MNISTNet):
         x = functional.seq_to_ann_forward(x, self.fc4)
         x = self.sn4(x)
 
-        x = functional.seq_to_ann_forward(x, self.voting).mean(0)
+        x = functional.seq_to_ann_forward(x, self.voting)
 
         return x
 
@@ -149,7 +147,7 @@ class MultiStepNMNISTNet(MultiStepMNISTNet):
 
         x = functional.seq_to_ann_forward(x, self.voting)
 
-        return x.mean(0)
+        return x
 
 class CIFAR10Net(nn.Module):
     def __init__(self, channels=256, single_step_neuron: callable = None, **kwargs):
@@ -280,7 +278,7 @@ class MultiStepCIFAR10Net(CIFAR10Net):
         x = functional.seq_to_ann_forward(x, self.fc8)
         x = self.sn8(x)
 
-        x = functional.seq_to_ann_forward(x, self.voting).mean(0)
+        x = functional.seq_to_ann_forward(x, self.voting)
         return x
 
 
@@ -380,7 +378,7 @@ class MultiStepCIFAR10DVSNet(CIFAR10DVSNet):
         x = self.dp6(x)
         x = functional.seq_to_ann_forward(x, self.fc6)
         x = self.sn6(x)
-        x = functional.seq_to_ann_forward(x, self.voting).mean(0)
+        x = functional.seq_to_ann_forward(x, self.voting)
 
         return x
 
@@ -493,7 +491,7 @@ class MultiStepDVSGestureNet(DVSGestureNet):
         x = self.dp7(x)
         x = functional.seq_to_ann_forward(x, self.fc7)
         x = self.sn7(x)
-        x = functional.seq_to_ann_forward(x, self.voting).mean(0)
+        x = functional.seq_to_ann_forward(x, self.voting)
 
         return x
 
