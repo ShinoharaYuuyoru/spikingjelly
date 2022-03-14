@@ -45,14 +45,12 @@ def heaviside(x: torch.Tensor):
     '''
     return (x >= 0).to(x)
 
-def check_manual_grad(primitive_function, spiking_function, eps=1e-5):
+def check_manual_grad(primitive_function, spiking_function, *args, **kwargs):
     '''
     :param primitive_function: 梯度替代函数的原函数
     :type primitive_function: callable
     :param spiking_function: 梯度替代函数
     :type spiking_function: callable
-    :param eps: 最大误差
-    :type eps: float
 
     梯度替代函数的反向传播一般是手写的，可以用此函数去检查手写梯度是否正确。
 
@@ -62,18 +60,54 @@ def check_manual_grad(primitive_function, spiking_function, eps=1e-5):
 
     .. code-block:: python
 
-        surrogate.check_manual_grad(surrogate.ATan.primitive_function, surrogate.atan.apply)
+        def s2nn_apply(x, alpha, beta):
+            return surrogate.s2nn.apply(x, alpha, beta)
+
+        surrogate.check_manual_grad(surrogate.S2NN.primitive_function, s2nn_apply, alpha=4., beta=1.)
     '''
-    alpha = torch.tensor(1.0, dtype=torch.float)
-    x = torch.arange(-16, 16, 32 / 8192)
+    x = torch.arange(-2, 2, 32 / 8192)
+    # x = torch.as_tensor([-1., 0., 1.])
     x.requires_grad_(True)
-    primitive_function(x, alpha).sum().backward()
+    primitive_function(x, *args, **kwargs).sum().backward()
     x_grad_auto = x.grad.clone()
     x.grad.zero_()
-    spiking_function(x, alpha).sum().backward()
+    spiking_function(x, *args, **kwargs).sum().backward()
     x_grad_manual = x.grad.clone()
-    assert (x_grad_manual - x_grad_auto).abs().max().item() <= eps, 'x.grad is wrong!'
-    print('grad check pass')
+    print('auto   grad', x_grad_auto)
+    print('manual grad', x_grad_manual)
+    abs_error = (x_grad_manual - x_grad_auto).abs()
+    idx = abs_error.argmax()
+    print('max error', abs_error[idx], 'occurs at')
+    print(f'x[{idx}] = {x[idx]}')
+    print('auto   grad', x_grad_auto[idx])
+    print('manual grad', x_grad_manual[idx])
+
+def check_cuda_grad(neu: nn.Module, surrogate_function, device, *args, **kwargs):
+    # check_cuda_grad(neuron.MultiStepIFNode, surrogate.S2NN, device='cuda:1', alpha=4., beta=1.)
+    for dtype in [torch.float, torch.half]:
+        print(dtype)
+        net = neu(surrogate_function=surrogate_function(*args, **kwargs))
+        net.to(device)
+        x = torch.arange(-2, 2, 32 / 8192, device=device, dtype=dtype)
+        x = x.unsqueeze(-1)
+        x.requires_grad_(True)
+        net.backend = 'torch'
+        net(x).sum().backward()
+        x_grad_py = x.grad.clone()
+        x.grad.zero_()
+        net.reset()
+        net.backend = 'cupy'
+        net(x).sum().backward()
+        x_grad_cp = x.grad.clone()
+        # print('python grad', x_grad_py)
+        # print('cupy   grad', x_grad_cp)
+        abs_error = (x_grad_cp - x_grad_py).abs()
+        idx = abs_error.argmax()
+        print('max error', abs_error[idx], 'occurs at')
+        print(f'x[{idx}] = {x[idx]}')
+        print('python grad', x_grad_py[idx])
+        print('cupy   grad', x_grad_cp[idx])
+
 
 class SurrogateFunctionBase(nn.Module):
     def __init__(self, alpha, spiking=True):
@@ -377,7 +411,7 @@ class sigmoid(torch.autograd.Function):
 
 
 class Sigmoid(SurrogateFunctionBase):
-    def __init__(self, alpha=1.0, spiking=True):
+    def __init__(self, alpha=4.0, spiking=True):
         '''
         * :ref:`API in English <Sigmoid.__init__-en>`
         .. _Sigmoid.__init__-cn:
@@ -1221,5 +1255,284 @@ class SquarewaveFourierSeries(MultiArgsSurrogateFunctionBase):
     # plt.savefig('./docs/source/_static/API/clock_driven/surrogate/SquarewaveFourierSeries2.pdf')
     # plt.savefig('./docs/source/_static/API/clock_driven/surrogate/SquarewaveFourierSeries2.svg')
 
+class s2nn(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, x: torch.Tensor, alpha: float, beta: float):
+        if x.requires_grad:
+            ctx.save_for_backward(x)
+            ctx.alpha = alpha
+            ctx.beta = beta
+        return heaviside(x)
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        x = ctx.saved_tensors[0]
+        sgax = torch.sigmoid(ctx.alpha * x)
+        grad_x = torch.where(x < 0., ctx.alpha * sgax * (1. - sgax), ctx.beta / (x + 1.))
+        return grad_x * grad_output, None, None
+
+class S2NN(MultiArgsSurrogateFunctionBase):
+    def __init__(self, alpha=4., beta=1., spiking=True):
+        """
+        * :ref:`API in English <S2NN.__init__-en>`
+        .. _S2NN.__init__-cn:
+
+        :param alpha: 控制 ``x < 0`` 时梯度的参数
+        :param beta: 控制 ``x >= 0`` 时梯度的参数
+        :param spiking: 是否输出脉冲，默认为 ``True``，在前向传播时使用 ``heaviside`` 而在反向传播使用替代梯度。若为 ``False``
+            则不使用替代梯度，前向传播时，使用反向传播时的梯度替代函数对应的原函数
+
+        `S2NN: Time Step Reduction of Spiking Surrogate Gradients for Training Energy Efficient Single-Step Neural Networks <https://arxiv.org/abs/2201.10879>`_ 提出的S2NN替代函数。反向传播为
+
+        .. math::
+            g'(x) = \\begin{cases}
+                \\alpha * (1 - \\mathrm{sigmoid} (\\alpha x)) \\mathrm{sigmoid} (\\alpha x), x < 0 \\\\
+                \\beta (x + 1), x \ge 0
+            \\end{cases}
+
+        对应的原函数为
+
+        .. math::
+            g(x) = \\begin{cases}
+                \\mathrm{sigmoid} (\\alpha x), x < 0 \\\\
+                \\beta \\mathrm{ln}(x + 1) + 1, x \ge 0
+            \\end{cases}
+
+        .. image:: ./_static/API/clock_driven/surrogate/S2NN.*
+            :width: 100%
 
 
+        * :ref:`中文API <S2NN.__init__-cn>`
+        .. _S2NN.__init__-en:
+
+        :param alpha: the param that controls the gradient when ``x < 0``
+        :param beta: the param that controls the gradient when ``x >= 0``
+        :param spiking: whether output spikes. The default is ``True`` which means that using ``heaviside`` in forward
+            propagation and using surrogate gradient in backward propagation. If ``False``, in forward propagation,
+            using the primitive function of the surrogate gradient function used in backward propagation
+
+        The S2NN surrogate spiking function, which is proposed by `S2NN: Time Step Reduction of Spiking Surrogate Gradients for Training Energy Efficient Single-Step Neural Networks <https://arxiv.org/abs/2201.10879>`_. The gradient is defined by
+
+        .. math::
+            g'(x) = \\begin{cases}
+                \\alpha * (1 - \\mathrm{sigmoid} (\\alpha x)) \\mathrm{sigmoid} (\\alpha x), x < 0 \\\\
+                \\beta (x + 1), x \ge 0
+            \\end{cases}
+
+        The primitive function is defined by
+
+        .. math::
+            g(x) = \\begin{cases}
+                \\mathrm{sigmoid} (\\alpha x), x < 0 \\\\
+                \\beta \\mathrm{ln}(x + 1) + 1, x \ge 0
+            \\end{cases}
+
+        .. image:: ./_static/API/clock_driven/surrogate/S2NN.*
+            :width: 100%
+        """
+        super().__init__(spiking)
+        self.alpha = alpha
+        self.beta = beta
+        self.spiking = spiking
+        if spiking:
+            self.f = self.spiking_function
+        else:
+            self.f = self.primitive_function
+
+    def forward(self, x):
+        return self.f(x, self.alpha, self.beta)
+
+    @staticmethod
+    def spiking_function(x: torch.Tensor, alpha, beta):
+        return s2nn.apply(x, alpha, beta)
+
+    @staticmethod
+    def primitive_function(x: torch.Tensor, alpha, beta):
+        return torch.where(x < 0., torch.sigmoid(x * alpha), beta * torch.log((x + 1.).abs_() + 1e-5) + 0.5)
+        # abs and 1e-5 are used to avoid nan
+
+    def cuda_code(self, x: str, y: str, dtype='fp32'):
+        sg_name = 'sg_' + self._get_name()
+        alpha = str(self.alpha) + 'f'
+        beta = str(self.beta) + 'f'
+        code = f'''
+            {tab4_str}{self.cuda_code_start_comments()}
+        '''
+
+        if dtype == 'fp32':
+            code += f'''
+            {tab4_str}const float {sg_name}_sigmoid_ax = 1.0f / (1.0f + expf(- {alpha} * {x}));
+            {tab4_str}const float {sg_name}_mask_l = (float)({x} < 0.0f);
+            {tab4_str}const float {y} = (1.0f - {sg_name}_sigmoid_ax) * {sg_name}_sigmoid_ax * {alpha} * {sg_name}_mask_l + {beta} / ({x} + 1.0f) * (1.0f - {sg_name}_mask_l);
+            '''
+        elif dtype == 'fp16':
+            code += f'''
+            {tab4_str}const half2 {sg_name}_alpha = __float2half2_rn({alpha});
+            {tab4_str}const half2 {sg_name}_sigmoid_ax = __h2div(__float2half2_rn(1.0f), __hadd2(h2exp(__hneg2(__hmul2({sg_name}_alpha, {x}))), __float2half2_rn(1.0f)));
+            {tab4_str}const half2 {sg_name}_mask_l = __hlt2({x}, __float2half2_rn(0.0f));
+            {tab4_str}const half2 {y} = __hadd2(__hmul2(__hmul2(__hmul2(__hsub2(__float2half2_rn(1.0f), {sg_name}_sigmoid_ax), {sg_name}_sigmoid_ax), {sg_name}_alpha), {sg_name}_mask_l), __hmul2(__h2div(__float2half2_rn({beta}), __hadd2({x}, __float2half2_rn(1.0f))), __hsub2(__float2half2_rn(1.0f), {sg_name}_mask_l)));
+            '''
+        else:
+            raise NotImplementedError
+        code += f'''
+            {tab4_str}{self.cuda_code_end_comments()}
+        '''
+        return code
+
+    # plt.style.use(['science', 'muted', 'grid'])
+    # fig = plt.figure(dpi=200, figsize=(6, 4))
+    # x = torch.arange(-2.5, 2.5, 0.001)
+    # plt.plot(x.data, surrogate.heaviside(x), label='Heaviside', linestyle='-.')
+    # surrogate_function = surrogate.S2NN(alpha=4., beta=1., spiking=False)
+    # y = surrogate_function(x)
+    # plt.plot(x.data, y.data, label='Primitive, $\\alpha=4, \\beta=1$')
+    #
+    # surrogate_function = surrogate.S2NN(alpha=4, beta=1., spiking=True)
+    # x.requires_grad_(True)
+    # y = surrogate_function(x)
+    # z = y.sum()
+    # z.backward()
+    # plt.plot(x.data, x.grad, label='Gradient, $\\alpha=4, \\beta=1$')
+    # plt.xlim(-2, 2)
+    # plt.legend()
+    # plt.title('S2NN surrogate function')
+    # plt.xlabel('Input')
+    # plt.ylabel('Output')
+    # plt.grid(linestyle='--')
+    # # plt.show()
+    # plt.savefig('./S2NN.svg')
+    # plt.savefig('./S2NN.pdf')
+
+class q_pseudo_spike(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, x, alpha):
+        if x.requires_grad:
+            ctx.save_for_backward(x)
+            ctx.alpha = alpha
+        return heaviside(x)
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        grad_x = None
+        x = ctx.saved_tensors[0]
+        if ctx.needs_input_grad[0]:
+            grad_x = ((1 + 2 / (ctx.alpha - 1) * x.abs()).pow_(-ctx.alpha)) * grad_output
+        return grad_x, None
+
+class QPseudoSpike(SurrogateFunctionBase):
+    def __init__(self, alpha=2.0, spiking=True):
+        '''
+        * :ref:`API in English <QPseudoSpike.__init__-en>`
+        .. _QPseudoSpike.__init__-cn:
+
+        :param alpha: 控制反向传播时梯度函数尾部厚度的参数
+        :param spiking: 是否输出脉冲，默认为 ``True``，在前向传播时使用 ``heaviside`` 而在反向传播使用替代梯度。若为 ``False``
+            则不使用替代梯度，前向传播时，使用反向传播时的梯度替代函数对应的原函数
+
+        `Surrogate Gradients Design <https://arxiv.org/abs/2202.00282>`_ 提出的 :math:`q`-PseudoSpike替代函数。反向传播为
+
+        .. math::
+            g'(x) = (1+\\frac{2|x|}{\\alpha-1})^{-\\alpha}
+
+        其中 :math:`\\alpha>1` 对应原文中的 :math:`q`。
+
+        对应的原函数为
+
+        .. math::
+            g(x) =
+            \\begin{cases}
+            \\frac{1}{2}(1-\\frac{2x}{\\alpha-1})^{1-\\alpha}, & x < 0 \\\\
+            1 - \\frac{1}{2}(1+\\frac{2x}{\\alpha-1})^{1-\\alpha}, & x \\geq 0.
+            \\end{cases}
+
+        .. image:: ./_static/API/clock_driven/surrogate/QPseudoSpike.*
+            :width: 100%
+
+        * :ref:`中文API <QPseudoSpike.__init__-cn>`
+        .. _QPseudoSpike.__init__-en:
+
+        :param alpha: parameter to control tail fatness of gradient
+        :param spiking: whether output spikes. The default is ``True`` which means that using ``heaviside`` in forward
+            propagation and using surrogate gradient in backward propagation. If ``False``, in forward propagation,
+            using the primitive function of the surrogate gradient function used in backward propagation
+
+        The :math:`q`-PseudoSpike surrogate spiking function, which is first proposed in `Surrogate Gradients Design <https://arxiv.org/abs/2202.00282>`_. The gradient is defined by
+
+        .. math::
+            g'(x) = (1+\\frac{2|x|}{\\alpha-1})^{-\\alpha}
+
+        where :math:`\\alpha>1` corresponds to :math:`q` in paper.
+
+        The primitive function is defined by
+
+        .. math::
+            g(x) =
+            \\begin{cases}
+            \\frac{1}{2}(1-\\frac{2x}{\\alpha-1})^{1-\\alpha}, & x < 0 \\\\
+            1 - \\frac{1}{2}(1+\\frac{2x}{\\alpha-1})^{1-\\alpha}, & x \\geq 0.
+            \\end{cases}
+
+        .. image:: ./_static/API/clock_driven/surrogate/QPseudoSpike.*
+            :width: 100%
+        '''
+        super().__init__(alpha, spiking)
+
+
+    @staticmethod
+    def spiking_function(x, alpha):
+        return q_pseudo_spike.apply(x, alpha)
+
+    @staticmethod
+    def primitive_function(x: torch.Tensor, alpha):
+        mask_nonnegative = heaviside(x)
+        mask_sign = mask_nonnegative * 2. - 1.
+
+        return mask_nonnegative - mask_sign * (0.5 * ((1. + 2. / (alpha - 1.) * x * mask_sign).pow_(1. - alpha)))
+
+    def cuda_code(self, x: str, y: str, dtype='fp32'):
+        sg_name = 'sg_' + self._get_name()
+        alpha = str(self.alpha) + 'f'
+        code = f'''
+            {tab4_str}{self.cuda_code_start_comments()}
+        '''
+
+        if dtype == 'fp32':
+            code += f'''
+            {tab4_str}const float {sg_name}_base = 1.0f + 2.0f / ({alpha} - 1.0f) * fabsf({x});
+            {tab4_str}const float {y} = powf({sg_name}_base, -{alpha});
+            '''
+        elif dtype == 'fp16':
+            code += f'''
+            {tab4_str}const half2 {sg_name}_alpha = __float2half2_rn({alpha});
+            {tab4_str}const half2 {sg_name}_base = __hadd2(__float2half2_rn(1.0f), __h2div(__hmul2(__float2half2_rn(2.0f), __habs2({x})), __hsub2({sg_name}_alpha, __float2half2_rn(1.0f))));
+            {tab4_str}const half2 {y} = h2exp2(__hmul2(h2log2({sg_name}_base), __hneg2({sg_name}_alpha))); // Replace power with combination of log and exp, since CUDA has no power function for FP16.
+            '''
+        else:
+            raise NotImplementedError
+        code += f'''
+            {tab4_str}{self.cuda_code_end_comments()}
+        '''
+        return code
+
+    # plt.style.use(['science', 'muted', 'grid'])
+    # fig = plt.figure(dpi=200, figsize=(6, 4))
+    # x = torch.arange(-2.5, 2.5, 0.001)
+    # plt.plot(x.data, surrogate.heaviside(x), label='Heaviside', linestyle='-.')
+    # surrogate_function = surrogate.QPseudoSpike(alpha=2, spiking=False)
+    # y = surrogate_function(x)
+    # plt.plot(x.data, y.data, label='Primitive, $\\alpha=2$')
+
+    # surrogate_function = surrogate.QPseudoSpike(alpha=2, spiking=True)
+    # x.requires_grad_(True)
+    # y = surrogate_function(x)
+    # z = y.sum()
+    # z.backward()
+    # plt.plot(x.data, x.grad, label='Gradient, $\\alpha=2$')
+    # plt.xlim(-2, 2)
+    # plt.legend()
+    # plt.title('QPseudoSpike surrogate function')
+    # plt.xlabel('Input')
+    # plt.ylabel('Output')
+    # plt.grid(linestyle='--')
+    # # plt.savefig('QPseudoSpike.svg')
+    # # plt.savefig('QPseudoSpike.pdf')

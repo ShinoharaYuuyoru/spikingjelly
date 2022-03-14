@@ -26,7 +26,7 @@ Note that SpikingJelly is based on PyTorch. Please make sure that you have insta
 
 The odd version number is the developing version, which is updated with GitHub/OpenI repository. The even version number is the stable version and available at PyPI.
 
-**Install the last stable version (0.0.0.0.6) from** [**PyPI**](https://pypi.org/project/spikingjelly/):
+**Install the last stable version from** [**PyPI**](https://pypi.org/project/spikingjelly/):
 
 ```bash
 pip install spikingjelly
@@ -40,12 +40,14 @@ git clone https://github.com/fangwei123456/spikingjelly.git
 cd spikingjelly
 python setup.py install
 ```
-From [OpenI](https://git.openi.org.cn/OpenI/spikingjelly)：
+From [OpenI](https://git.openi.org.cn/OpenI/spikingjelly):
 ```bash
 git clone https://git.openi.org.cn/OpenI/spikingjelly.git
 cd spikingjelly
 python setup.py install
 ```
+If you use an old version of SpikingJelly, you may meet some fatal bugs. Refer to [Bugs History with Releases](./bugs.md) for more details.
+
 ## Build SNN In An Unprecedented Simple Way
 
 SpikingJelly is user-friendly. Building SNN with SpikingJelly is as simple as building ANN in PyTorch:
@@ -144,13 +146,15 @@ As simple as using PyTorch.
 ## Neuromorphic Datasets Supports
 SpikingJelly includes the following neuromorphic datasets:
 
-| Dataset        | Source                                                       |
+| Dataset | Source |
 | -------------- | ------------------------------------------------------------ |
-| ASL-DVS        | Graph-based Object Classification for Neuromorphic Vision Sensing |
-| CIFAR10-DVS    | CIFAR10-DVS: An Event-Stream Dataset for Object Classification |
-| DVS128 Gesture | A Low Power, Fully Event-Based Gesture Recognition System    |
-| N-Caltech101   | Converting Static Image Datasets to Spiking Neuromorphic Datasets Using Saccades |
-| N-MNIST        | Converting Static Image Datasets to Spiking Neuromorphic Datasets Using Saccades |
+| ASL-DVS        | [Graph-based Object Classification for Neuromorphic Vision Sensing](https://openaccess.thecvf.com/content_ICCV_2019/html/Bi_Graph-Based_Object_Classification_for_Neuromorphic_Vision_Sensing_ICCV_2019_paper.html) |
+| CIFAR10-DVS    | [CIFAR10-DVS: An Event-Stream Dataset for Object Classification](https://internal-journal.frontiersin.org/articles/10.3389/fnins.2017.00309/full) |
+| DVS128 Gesture | [A Low Power, Fully Event-Based Gesture Recognition System](https://openaccess.thecvf.com/content_cvpr_2017/html/Amir_A_Low_Power_CVPR_2017_paper.html) |
+| ES-ImageNet    | [ES-ImageNet: A Million Event-Stream Classification Dataset for Spiking Neural Networks](https://www.frontiersin.org/articles/10.3389/fnins.2021.726582/full) |
+| N-Caltech101   | [Converting Static Image Datasets to Spiking Neuromorphic Datasets Using Saccades](https://www.frontiersin.org/articles/10.3389/fnins.2015.00437/full) |
+| N-MNIST        | [Converting Static Image Datasets to Spiking Neuromorphic Datasets Using Saccades](https://www.frontiersin.org/articles/10.3389/fnins.2015.00437/full) |
+| Nav Gesture    | [Event-Based Gesture Recognition With Dynamic Background Suppression Using Smartphone Computational Capabilities](https://www.frontiersin.org/articles/10.3389/fnins.2020.00275/full) |
 
 Users can use both the origin events data and frames data integrated by SpikingJelly:
 
@@ -182,7 +186,10 @@ SpikingJelly provides elaborate tutorials. Here are some of tutorials:
 | ![t6](./docs/source/_static/tutorials/clock_driven/6_dqn_cart_pole/512@66.gif) | [Reinforcement Learning: Deep Q Learning](https://spikingjelly.readthedocs.io/zh_CN/latest/clock_driven_en/6_dqn_cart_pole.html) |
 | ![t10](./docs/source/_static/tutorials/clock_driven/10_propagation_pattern/layer-by-layer.png) | [Propagation Pattern](https://spikingjelly.readthedocs.io/zh_CN/latest/clock_driven_en/10_propagation_pattern.html) |
 | ![t13](./docs/source/_static/tutorials/clock_driven/13_neuromorphic_datasets/dvsg.gif) | [Neuromorphic Datasets Processing](https://spikingjelly.readthedocs.io/zh_CN/latest/clock_driven_en/13_neuromorphic_datasets.html) |
-| ![t14](./docs/source/_static/tutorials/clock_driven/14_classify_dvsg/test_acc.png) | [Classify DVS128 Gesture](https://spikingjelly.readthedocs.io/zh_CN/latest/clock_driven_en/14_classify_dvsg.html) |
+| ![t14](./docs/source/_static/tutorials/clock_driven/14_classify_dvsg/network.png) | [Classify DVS128 Gesture](https://spikingjelly.readthedocs.io/zh_CN/latest/clock_driven_en/14_classify_dvsg.html) |
+| ![t15](./docs/source/_static/tutorials/clock_driven/15_recurrent_connection_and_stateful_synapse/SRNN_example.png) | [Recurrent Connections and Stateful Synapses](https://spikingjelly.readthedocs.io/zh_CN/latest/clock_driven_en/15_recurrent_connection_and_stateful_synapse.html) |
+
+Other tutorials that are not listed here are also available at the document https://spikingjelly.readthedocs.io.
 
 ## Publications and Citation
 
@@ -200,9 +207,13 @@ If you use SpikingJelly in your work, please cite it as follows:
 }
 ```
 
+Note: To specify the version of framework you are using, the default value `YYYY-MM-DD` in the `note` field should be replaced with the date of the last change of the framework you are using, i.e. the date of the latest commit.
+
 ## Contribution
 
 You can read the issues and get the problems to be solved and latest development plans. We welcome all users to join the discussion of development plans, solve issues, and send pull requests.
+
+Not all API documents are written in both English and Chinese. We welcome users to complete translation (from English to Chinese, or from Chinese to English).
 
 ## About
 

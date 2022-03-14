@@ -7,6 +7,7 @@ from torch.cuda import amp
 import os
 import datetime
 from .. import functional
+from typing import Callable
 
 def use_dist():
     # whether use distributed training
@@ -23,8 +24,9 @@ def on_master():
         return True
 
 
-def cal_correct(output, target, topk=(1,)):
-    # modified by def accuracy() in https://github.com/pytorch/vision/blob/main/references/classification/utils.py
+def default_cal_acc1_acc5(output, target):
+    # modified by ``def accuracy()`` in https://github.com/pytorch/vision/blob/main/references/classification/utils.py
+    topk = (1, 5)
     with torch.no_grad():
         maxk = max(topk)
 
@@ -38,7 +40,7 @@ def cal_correct(output, target, topk=(1,)):
             res.append(correct_k)
         return res
 
-def train_one_epoch(model, criterion, optimizer, data_loader, device, amp_scaler=None):
+def train_one_epoch(model, criterion, optimizer, data_loader, device, amp_scaler=None, cal_acc1_acc5: Callable=default_cal_acc1_acc5):
     model.train()
     train_acc1 = 0.
     train_acc5 = 0.
@@ -47,7 +49,7 @@ def train_one_epoch(model, criterion, optimizer, data_loader, device, amp_scaler
     start_time = time.time()
 
     for image, target in data_loader:
-        image, target = image.to(device), target.to(device)
+        image, target = image.to(device, non_blocking=True), target.to(device, non_blocking=True)
         optimizer.zero_grad()
 
         if amp_scaler is not None:
@@ -64,7 +66,7 @@ def train_one_epoch(model, criterion, optimizer, data_loader, device, amp_scaler
             optimizer.step()
         functional.reset_net(model)
 
-        correct1, correct5 = cal_correct(output, target, topk=(1, 5))
+        correct1, correct5 = cal_acc1_acc5(output, target)
         train_acc1 += correct1
         train_acc5 += correct5
         train_loss += loss.item() * image.shape[0]
@@ -97,7 +99,8 @@ def train_one_epoch(model, criterion, optimizer, data_loader, device, amp_scaler
     print(f'Train: train_acc1={train_acc1:.3f}, train_acc5={train_acc5:.3f}, train_loss={train_loss:.6f}, samples/s={samples_number / (time.time() - start_time):.3f}')
     return train_acc1, train_acc5, train_loss
 
-def evaluate(model, criterion, data_loader, device):
+@torch.no_grad()
+def evaluate(model, criterion, data_loader, device, cal_acc1_acc5: Callable=default_cal_acc1_acc5):
     model.eval()
     test_acc1 = 0.
     test_acc5 = 0.
@@ -106,14 +109,14 @@ def evaluate(model, criterion, data_loader, device):
     start_time = time.time()
 
     for image, target in data_loader:
-        image, target = image.to(device), target.to(device)
+        image, target = image.to(device, non_blocking=True), target.to(device, non_blocking=True)
 
         output = model(image)
         loss = criterion(output, target)
 
         functional.reset_net(model)
 
-        correct1, correct5 = cal_correct(output, target, topk=(1, 5))
+        correct1, correct5 = cal_acc1_acc5(output, target)
         test_acc1 += correct1
         test_acc5 += correct5
         test_loss += loss.item() * image.shape[0]
@@ -143,12 +146,13 @@ def evaluate(model, criterion, data_loader, device):
     test_acc5 *= 100.
     test_loss /= samples_number
 
-    print(f'Test: test_acc1={test_acc1:.3f}, test_acc5={test_acc5:.3f}, train_loss={test_loss:.6f}, samples/s={samples_number / (time.time() - start_time):.3f}')
+    print(f'Test: test_acc1={test_acc1:.3f}, test_acc5={test_acc5:.3f}, test_loss={test_loss:.6f}, samples/s={samples_number / (time.time() - start_time):.3f}')
     return test_acc1, test_acc5, test_loss
-def train_eval_loop(args, device, model, criterion, optimizer, lr_scheduler, train_data_loader, test_data_loader, max_epoch, use_amp=False, tb_log_dir: str=None, pt_dir: str=None, resume_pt :str=None):
+
+def train_eval_loop(args, device, model, criterion, optimizer, lr_scheduler, train_data_loader, test_data_loader, max_epoch, use_amp=False, tb_log_dir: str=None, pt_dir: str=None, resume_pt: str=None, cal_acc1_acc5: Callable=default_cal_acc1_acc5):
 
     start_epoch = 0
-    if resume_pt is not None:
+    if resume_pt is not None and resume_pt != '':
         checkpoint = torch.load(resume_pt, map_location='cpu')
         if isinstance(model, torch.nn.parallel.DistributedDataParallel):
             model.module.load_state_dict(checkpoint['model'])
@@ -165,6 +169,8 @@ def train_eval_loop(args, device, model, criterion, optimizer, lr_scheduler, tra
         amp_scaler = None
 
     if on_master() and tb_log_dir is not None:
+        if not os.path.exists(tb_log_dir):
+            os.makedirs(tb_log_dir)
         tb_writer = SummaryWriter(tb_log_dir, purge_step=start_epoch)
     else:
         tb_writer = None
@@ -179,7 +185,7 @@ def train_eval_loop(args, device, model, criterion, optimizer, lr_scheduler, tra
     for epoch in range(start_epoch, max_epoch):
         start_time = time.time()
         print(f'epoch={epoch}, args={args}')
-        acc1, acc5, loss = train_one_epoch(model, criterion, optimizer, train_data_loader, device, amp_scaler)
+        acc1, acc5, loss = train_one_epoch(model, criterion, optimizer, train_data_loader, device, amp_scaler, cal_acc1_acc5)
         if tb_writer is not None:
             tb_writer.add_scalar('train_loss', loss, epoch)
             tb_writer.add_scalar('train_acc1', acc1, epoch)
@@ -188,7 +194,7 @@ def train_eval_loop(args, device, model, criterion, optimizer, lr_scheduler, tra
         if lr_scheduler is not None:
             lr_scheduler.step()
 
-        acc1, acc5, loss = evaluate(model, criterion, test_data_loader, device)
+        acc1, acc5, loss = evaluate(model, criterion, test_data_loader, device, cal_acc1_acc5)
 
         if tb_writer is not None:
             tb_writer.add_scalar('test_loss', loss, epoch)
@@ -234,6 +240,49 @@ def train_eval_loop(args, device, model, criterion, optimizer, lr_scheduler, tra
         if pt_dir is not None:
             print('pt dir=', pt_dir)
         print(f'escape time={(datetime.datetime.now() + datetime.timedelta(seconds=used_time * (max_epoch - epoch))).strftime("%Y-%m-%d %H:%M:%S")}\n')
+
+def setup_for_distributed(is_master):
+    """
+    This function disables printing when not in master process
+    """
+    import builtins as __builtin__
+    builtin_print = __builtin__.print
+
+    def print(*args, **kwargs):
+        force = kwargs.pop('force', False)
+        if is_master or force:
+            builtin_print(*args, **kwargs)
+
+    __builtin__.print = print
+
+def distributed_training_init(args, model):
+    if 'RANK' in os.environ and 'WORLD_SIZE' in os.environ:
+        args.rank = int(os.environ["RANK"])
+        args.world_size = int(os.environ['WORLD_SIZE'])
+        args.device = int(os.environ['LOCAL_RANK'])
+    elif 'SLURM_PROCID' in os.environ:
+        args.rank = int(os.environ['SLURM_PROCID'])
+        args.device = args.rank % torch.cuda.device_count()
+    elif hasattr(args, "rank"):
+        pass
+    else:
+        print('Not using distributed mode')
+        args.distributed = False
+        model.to(args.device)
+        return model
+    model.to(args.device)
+    args.distributed = True
+    args.dist_backend = 'nccl'
+    print('| distributed init (rank {}): {}'.format(
+        args.rank, args.dist_url), flush=True)
+    torch.distributed.init_process_group(backend=args.dist_backend, init_method=args.dist_url,
+                                         world_size=args.world_size, rank=args.rank)
+    if args.distributed and args.sync_bn:
+        model = torch.nn.SyncBatchNorm.convert_sync_batchnorm(model)
+    if args.distributed:
+        model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[args.device])
+    setup_for_distributed(args.rank == 0)
+    return model
 
 
 

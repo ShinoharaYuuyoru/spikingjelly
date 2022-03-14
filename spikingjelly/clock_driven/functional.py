@@ -1,7 +1,13 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from . import neuron
+import math
+from . import neuron, spike_op
+
+from torch import Tensor
+from typing import Optional, Union
+
+from torch.types import _int, _size
 
 def reset_net(net: nn.Module):
     '''
@@ -29,7 +35,7 @@ def reset_net(net: nn.Module):
         if hasattr(m, 'reset'):
             m.reset()
 
-def spike_cluster(v: torch.Tensor, v_threshold, T_in: int):
+def spike_cluster(v: Tensor, v_threshold, T_in: int):
     '''
     * :ref:`API in English <spike_cluster-en>`
 
@@ -179,7 +185,7 @@ def spike_cluster(v: torch.Tensor, v_threshold, T_in: int):
 
         return N_o, k_positive, k_negative
 
-def spike_similar_loss(spikes:torch.Tensor, labels:torch.Tensor, kernel_type='linear', loss_type='mse', *args):
+def spike_similar_loss(spikes:Tensor, labels:Tensor, kernel_type='linear', loss_type='mse', *args):
     '''
     * :ref:`API in English <spike_similar_loss-en>`
 
@@ -284,7 +290,7 @@ def spike_similar_loss(spikes:torch.Tensor, labels:torch.Tensor, kernel_type='li
     else:
         raise NotImplementedError
 
-def kernel_dot_product(x:torch.Tensor, y:torch.Tensor, kernel='linear', *args):
+def kernel_dot_product(x:Tensor, y:Tensor, kernel='linear', *args):
 
     '''
     * :ref:`API in English <kernel_dot_product-en>`
@@ -348,7 +354,7 @@ def kernel_dot_product(x:torch.Tensor, y:torch.Tensor, kernel='linear', *args):
     else:
         raise NotImplementedError
 
-def set_threshold_margin(output_layer:neuron.BaseNode, label_one_hot:torch.Tensor,
+def set_threshold_margin(output_layer:neuron.BaseNode, label_one_hot:Tensor,
                          eval_threshold=1.0, threshold0=0.9, threshold1=1.1):
     '''
     * :ref:`API in English <set_threshold_margin-en>`
@@ -390,7 +396,7 @@ def set_threshold_margin(output_layer:neuron.BaseNode, label_one_hot:torch.Tenso
     else:
         output_layer.v_threshold = eval_threshold
 
-def redundant_one_hot(labels:torch.Tensor, num_classes:int, n:int):
+def redundant_one_hot(labels:Tensor, num_classes:int, n:int):
     '''
     * :ref:`API in English <redundant_one_hot-en>`
 
@@ -452,7 +458,7 @@ def redundant_one_hot(labels:torch.Tensor, num_classes:int, n:int):
         codes += F.one_hot(labels * n + i, redundant_classes)
     return codes
 
-def first_spike_index(spikes: torch.Tensor):
+def first_spike_index(spikes: Tensor):
     '''
     * :ref:`API in English <first_spike_index-en>`
 
@@ -521,45 +527,46 @@ def first_spike_index(spikes: torch.Tensor):
         # 在时间维度上，2次cumsum后，元素为1的位置，即为首次发放脉冲的位置
         return spikes.cumsum(dim=-1).cumsum(dim=-1) == 1
 
-def multi_step_forward(x_seq: torch.Tensor, multi_step_module: nn.Module or list or tuple):
+def multi_step_forward(x_seq: Tensor, single_step_module: nn.Module or list or tuple or nn.Sequential):
     """
     :param x_seq: shape=[T, batch_size, ...]
-    :type x_seq: torch.Tensor
-    :param multi_step_module: a multi-step module, or a list/tuple that contains multi-step modules
-    :type multi_step_module: torch.nn.Module or list or tuple
+    :type x_seq: Tensor
+    :param single_step_module: a single-step module, or a list/tuple that contains single-step modules
+    :type single_step_module: torch.nn.Module or list or tuple or torch.nn.Sequential
     :return: y_seq, shape=[T, batch_size, ...]
-    :rtype: torch.Tensor
+    :rtype: Tensor
 
     See :class:`spikingjelly.clock_driven.layer.MultiStepContainer` for more details.
     """
     y_seq = []
-    if isinstance(multi_step_module, (list, tuple)):
+    if isinstance(single_step_module, (list, tuple, nn.Sequential)):
         for t in range(x_seq.shape[0]):
             x_seq_t = x_seq[t]
-            for m in multi_step_module:
+            for m in single_step_module:
                 x_seq_t = m(x_seq_t)
             y_seq.append(x_seq_t)
-            y_seq[-1].unsqueeze_(0)
     else:
         for t in range(x_seq.shape[0]):
-            y_seq.append(multi_step_module(x_seq[t]))
-            y_seq[-1].unsqueeze_(0)
+            y_seq.append(single_step_module(x_seq[t]))
+
+    for t in range(y_seq.__len__()):
+        y_seq[t] = y_seq[t].unsqueeze(0)
     return torch.cat(y_seq, 0)
 
-def seq_to_ann_forward(x_seq: torch.Tensor, stateless_module: nn.Module or list or tuple):
+def seq_to_ann_forward(x_seq: Tensor, stateless_module: nn.Module or list or tuple or nn.Sequential):
     """
     :param x_seq: shape=[T, batch_size, ...]
-    :type x_seq: torch.Tensor
-    :param multi_step_module: a stateless module, e.g., 'torch.nn.Conv2d' or a list contains stateless modules, e.g., '[torch.nn.Conv2d, torch.nn.BatchNorm2d]
-    :type multi_step_module: torch.nn.Module or list or tuple
+    :type x_seq: Tensor
+    :param stateless_module: a stateless module, e.g., 'torch.nn.Conv2d' or a list contains stateless modules, e.g., '[torch.nn.Conv2d, torch.nn.BatchNorm2d]
+    :type stateless_module: torch.nn.Module or list or tuple or torch.nn.Sequential
     :return: y_seq, shape=[T, batch_size, ...]
-    :rtype: torch.Tensor
+    :rtype: Tensor
 
     See :class:`spikingjelly.clock_driven.layer.SeqToANNContainer` for more details.
     """
     y_shape = [x_seq.shape[0], x_seq.shape[1]]
     y = x_seq.flatten(0, 1)
-    if isinstance(stateless_module, (list, tuple)):
+    if isinstance(stateless_module, (list, tuple, nn.Sequential)):
         for m in stateless_module:
             y = m(y)
     else:
@@ -567,4 +574,348 @@ def seq_to_ann_forward(x_seq: torch.Tensor, stateless_module: nn.Module or list 
     y_shape.extend(y.shape[1:])
     return y.view(y_shape)
 
+def fused_conv2d_weight_of_convbn2d(conv2d: nn.Conv2d, bn2d: nn.BatchNorm2d):
+    """
+    :param conv2d: a Conv2d layer
+    :type conv2d: torch.nn.Conv2d
+    :param bn2d: a BatchNorm2d layer
+    :type bn2d: torch.nn.BatchNorm2d
+    :return: the weight of this fused module
+    :rtype: Tensor
 
+    A {Conv2d-BatchNorm2d} can be fused to a {Conv2d} module with BatchNorm2d's parameters being absorbed into Conv2d.
+    This function returns the weight of this fused module.
+
+    .. admonition:: Note
+        :class: note
+
+        We assert `conv2d.bias` is `None`. See `Disable bias for convolutions directly followed by a batch norm <https://pytorch.org/tutorials/recipes/recipes/tuning_guide.html#disable-bias-for-convolutions-directly-followed-by-a-batch-norm>`_ for more details.
+
+    """
+    assert conv2d.bias is None
+    return (conv2d.weight.transpose(0, 3) * bn2d.weight / (
+                    bn2d.running_var + bn2d.eps).sqrt()).transpose(0, 3)
+
+
+def fused_conv2d_bias_of_convbn2d(conv2d: nn.Conv2d, bn2d: nn.BatchNorm2d):
+    """
+    :param conv2d: a Conv2d layer
+    :type conv2d: torch.nn.Conv2d
+    :param bn2d: a BatchNorm2d layer
+    :type bn2d: torch.nn.BatchNorm2d
+    :return: the bias of this fused module
+    :rtype: Tensor
+
+    A {Conv2d-BatchNorm2d} can be fused to a {Conv2d} module with BatchNorm2d's parameters being absorbed into Conv2d.
+    This function returns the bias of this fused module.
+
+    .. admonition:: Note
+        :class: note
+
+        We assert `conv2d.bias` is `None`. See `Disable bias for convolutions directly followed by a batch norm <https://pytorch.org/tutorials/recipes/recipes/tuning_guide.html#disable-bias-for-convolutions-directly-followed-by-a-batch-norm>`_ for more details.
+
+    """
+    assert conv2d.bias is None
+    return bn2d.bias - bn2d.running_mean * bn2d.weight / (bn2d.running_var + bn2d.eps).sqrt()
+
+
+@torch.no_grad()
+def scale_fused_conv2d_weight_of_convbn2d(conv2d: nn.Conv2d, bn2d: nn.BatchNorm2d, k=None, b=None):
+    """
+    :param conv2d: a Conv2d layer
+    :type conv2d: torch.nn.Conv2d
+    :param bn2d: a BatchNorm2d layer
+    :type bn2d: torch.nn.BatchNorm2d
+
+    A {Conv2d-BatchNorm2d} can be fused to a {Conv2d} module with BatchNorm2d's parameters being absorbed into Conv2d.
+    This function sets the weight of this fused module to `weight * k + b`.
+
+    .. admonition:: Note
+        :class: note
+
+        We assert `conv2d.bias` is `None`. See `Disable bias for convolutions directly followed by a batch norm <https://pytorch.org/tutorials/recipes/recipes/tuning_guide.html#disable-bias-for-convolutions-directly-followed-by-a-batch-norm>`_ for more details.
+
+    """
+    assert conv2d.bias is None
+    if k is not None:
+        conv2d.weight.data *= k
+    if b is not None:
+        conv2d.weight.data += b
+        
+
+@torch.no_grad()
+def scale_fused_conv2d_bias_of_convbn2d(conv2d: nn.Conv2d, bn2d: nn.BatchNorm2d, k=None, b=None):
+    """
+    :param conv2d: a Conv2d layer
+    :type conv2d: torch.nn.Conv2d
+    :param bn2d: a BatchNorm2d layer
+    :type bn2d: torch.nn.BatchNorm2d
+
+    A {Conv2d-BatchNorm2d} can be fused to a {Conv2d} module with BatchNorm2d's parameters being absorbed into Conv2d.
+    This function sets the bias of this fused module to `bias * k + b`.
+
+    .. admonition:: Note
+        :class: note
+
+        We assert `conv2d.bias` is `None`. See `Disable bias for convolutions directly followed by a batch norm <https://pytorch.org/tutorials/recipes/recipes/tuning_guide.html#disable-bias-for-convolutions-directly-followed-by-a-batch-norm>`_ for more details.
+
+    """
+    assert conv2d.bias is None
+    if k is not None:
+        bn2d.bias.data *= k
+        bn2d.running_mean *= k
+    if b is not None:
+        bn2d.bias.data += b
+
+@torch.no_grad()
+def fuse_convbn2d(conv2d: nn.Conv2d, bn2d: nn.BatchNorm2d, k=None, b=None):
+    """
+    :param conv2d: a Conv2d layer
+    :type conv2d: torch.nn.Conv2d
+    :param bn2d: a BatchNorm2d layer
+    :type bn2d: torch.nn.BatchNorm2d
+    :return: the fused Conv2d layer
+    :rtype: torch.nn.Conv2d
+
+    A {Conv2d-BatchNorm2d} can be fused to a {Conv2d} module with BatchNorm2d's parameters being absorbed into Conv2d.
+    This function returns the fused module.
+
+    .. admonition:: Note
+        :class: note
+
+        We assert `conv2d.bias` is `None`. See `Disable bias for convolutions directly followed by a batch norm <https://pytorch.org/tutorials/recipes/recipes/tuning_guide.html#disable-bias-for-convolutions-directly-followed-by-a-batch-norm>`_ for more details.
+    """
+    fused_conv = nn.Conv2d(in_channels=conv2d.in_channels, out_channels=conv2d.out_channels,
+                     kernel_size=conv2d.kernel_size,
+                     stride=conv2d.stride, padding=conv2d.padding, dilation=conv2d.dilation,
+                     groups=conv2d.groups, bias=True,
+                     padding_mode=conv2d.padding_mode)
+    fused_conv.weight.data = fused_conv2d_weight_of_convbn2d(conv2d, bn2d)
+    fused_conv.bias.data = fused_conv2d_bias_of_convbn2d(conv2d, bn2d)
+    return fused_conv
+
+def temporal_efficient_training_cross_entropy(x_seq: Tensor, target: torch.LongTensor):
+    """
+    :param x_seq: ``shape=[T, N, C, *]``, where ``C`` is the number of classes
+    :type x_seq: Tensor
+    :param target: ``shape=[N]``, where ``0 <= target[i] <= C-1``
+    :type target: torch.LongTensor
+    :return: the temporal efficient training cross entropy
+    :rtype: Tensor
+
+    The temporal efficient training (TET) cross entropy, which is the mean of cross entropy of each time-step.
+
+    Codes example:
+
+    .. code-block:: python
+
+        def tet_ce_for_loop_version(x_seq: Tensor, target: torch.LongTensor):
+            loss = 0.
+            for t in range(x_seq.shape[0]):
+                loss += F.cross_entropy(x_seq[t], target)
+            return loss / x_seq.shape[0]
+
+        T = 8
+        N = 4
+        C = 10
+        x_seq = torch.rand([T, N, C])
+        target = torch.randint(low=0, high=C-1, size=[N])
+        print(tet_ce_for_loop_version(x_seq, target))
+        print(temporal_efficient_training_cross_entropy(x_seq, target))
+
+
+    .. admonition:: Tip
+        :class: tip
+
+        The TET cross entropy is proposed by `Temporal Efficient Training of Spiking Neural Network via Gradient Re-weighting <https://openreview.net/forum?id=_XNtisL32jv>`_.
+    """
+    x_seq = x_seq.transpose(0, 1).transpose(1, 2)  # [N, C, T, *]
+    N, C, T = x_seq.shape[0], x_seq.shape[1], x_seq.shape[2]
+    if x_seq.dim() == 3:
+        # x_seq.shape = [N, C, T]
+        # target.shape = [N]
+        target = target.unsqueeze(1).repeat(1, T)  # [N, T]
+    else:
+        # x_seq.shape = [N, C, T, d1, d2, ..., dk]
+        # target.shape = [N, d1, d2, ..., dk]
+        rep_shape = [1, T]
+        rep_shape.extend([1] * (x_seq.dim() - 3))
+        target = target.unsqueeze(1).repeat(rep_shape)
+
+    loss = F.cross_entropy(x_seq, target)
+    return loss
+
+def kaiming_normal_conv_linear_weight(net: nn.Module):
+    '''
+    * :ref:`API in English <kaiming_normal_conv_linear_weight-en>`
+
+    .. _reset_net-cn:
+
+    :param net: 任何属于 ``nn.Module`` 子类的网络
+
+    :return: None
+
+    使用kaiming normal初始化 `net` 中的所有 :class:`torch.nn._ConvNd` 和 `:class:`torch.nn.Linear` 的权重（不包括偏置项）。参见 :class:`torch.nn.init.kaiming_normal_`。
+
+    * :ref:`中文API <kaiming_normal_conv_linear_weight-cn>`
+
+    .. _reset_net-en:
+
+    :param net: Any network inherits from ``nn.Module``
+
+    :return: None
+
+    initialize all weights (not including bias) of :class:`torch.nn._ConvNd` and :class:`torch.nn.Linear` in `net` by the kaiming normal. See :class:`torch.nn.init.kaiming_normal_`
+    for more details.
+    '''
+    for m in net.modules():
+        if isinstance(m, (nn.Conv1d, nn.Conv2d, nn.Conv3d, nn.Linear)):
+            nn.init.kaiming_normal_(m.weight, a=math.sqrt(5))
+
+def spike_linear(spike: Tensor, weight: Tensor, bias: Optional[Tensor] = None) -> Tensor:
+    """
+    * :ref:`API in English <spike_linear-en>`
+
+    .. _spike_linear-cn:
+
+    :class:`torch.nn.functional.linear` 在输入为脉冲时的特例。
+
+    .. note::
+
+        在CUDA设备上训练时拥有比 :class:`torch.nn.functional.linear` 更低的显存消耗。
+
+    .. warning::
+
+        `spike` 中的任何元素都必须为0或1。
+
+    * :ref:`中文API <spike_linear-cn>`
+
+    .. _spike_linear-en:
+
+    A specific case of :class:`torch.nn.functional.linear` with inputs are spikes.
+
+    .. admonition:: Note
+        :class: note
+
+        This function has less memory consumption than :class:`torch.nn.functional.linear` when training on CUDA devices.
+
+    .. admonition:: Warning
+        :class: warning
+
+        Any element in `spike` must be 0 or 1.
+    """
+    if spike.get_device() < 0:
+        return F.linear(spike, weight, bias)
+    else:
+        return spike_op.spike_linear.apply(spike, weight, bias)
+
+def spike_conv1d(spike: Tensor, weight: Tensor, bias: Tensor=None, stride: Union[_int, _size]=1, padding: str="valid", dilation: Union[_int, _size]=1, groups: _int=1) -> Tensor:
+    """
+    * :ref:`API in English <spike_conv1d-en>`
+
+    .. _spike_conv1d-cn:
+
+    :class:`torch.nn.functional.conv1d` 在输入为脉冲时的特例。
+
+    .. note::
+
+        在CUDA设备上训练时拥有比 :class:`torch.nn.functional.conv1d` 更低的显存消耗。
+
+    .. warning::
+
+        `spike` 中的任何元素都必须为0或1。
+
+    * :ref:`中文API <spike_conv1d-cn>`
+
+    .. _spike_conv1d-en:
+
+    A specific case of :class:`torch.nn.functional.conv1d` with inputs are spikes.
+
+    .. admonition:: Note
+        :class: note
+
+        This function has less memory consumption than :class:`torch.nn.functional.conv1d` when training on CUDA devices.
+
+    .. admonition:: Warning
+        :class: warning
+
+        Any element in `spike` must be 0 or 1.
+    """
+    if spike.get_device() < 0:
+        return F.conv1d(spike, weight, bias, stride, padding, dilation, groups)
+    else:
+        return spike_op.spike_convolution.apply(spike, weight, bias, stride, padding, dilation, groups)
+
+def spike_conv2d(spike: Tensor, weight: Tensor, bias: Optional[Tensor]=None, stride: Union[_int, _size]=1, padding: str="valid", dilation: Union[_int, _size]=1, groups: _int=1) -> Tensor:
+    """
+    * :ref:`API in English <spike_conv2d-en>`
+
+    .. _spike_conv2d-cn:
+
+    :class:`torch.nn.functional.conv2d` 在输入为脉冲时的特例。
+
+    .. note::
+
+        在CUDA设备上训练时拥有比 :class:`torch.nn.functional.conv2d` 更低的显存消耗。
+
+    .. warning::
+
+        `spike` 中的任何元素都必须为0或1。
+
+    * :ref:`中文API <spike_conv2d-cn>`
+
+    .. _spike_conv2d-en:
+
+    A specific case of :class:`torch.nn.functional.conv2d` with inputs are spikes.
+
+    .. admonition:: Note
+        :class: note
+
+        This function has less memory consumption than :class:`torch.nn.functional.conv2d` when training on CUDA devices.
+
+    .. admonition:: Warning
+        :class: warning
+
+        Any element in `spike` must be 0 or 1.
+    """
+    if spike.get_device() < 0:
+        return F.conv2d(spike, weight, bias, stride, padding, dilation, groups)
+    else:
+        return spike_op.spike_convolution.apply(spike, weight, bias, stride, padding, dilation, groups)
+
+def spike_conv3d(spike: Tensor, weight: Tensor, bias: Optional[Tensor]=None, stride: Union[_int, _size]=1, padding: str="valid", dilation: Union[_int, _size]=1, groups: _int=1) -> Tensor:
+    """
+    * :ref:`API in English <spike_conv3d-en>`
+
+    .. _spike_conv3d-cn:
+
+    :class:`torch.nn.functional.conv3d` 在输入为脉冲时的特例。
+
+    .. note::
+
+        在CUDA设备上训练时拥有比 :class:`torch.nn.functional.conv3d` 更低的显存消耗。
+
+    .. warning::
+
+        `spike` 中的任何元素都必须为0或1。
+
+    * :ref:`中文API <spike_conv3d-cn>`
+
+    .. _spike_conv3d-en:
+
+    A specific case of :class:`torch.nn.functional.conv3d` with inputs are spikes.
+
+    .. admonition:: Note
+        :class: note
+
+        This function has less memory consumption than :class:`torch.nn.functional.conv3d` when training on CUDA devices.
+
+    .. admonition:: Warning
+        :class: warning
+
+        Any element in `spike` must be 0 or 1.
+    """
+    if spike.get_device() < 0:
+        return F.conv3d(spike, weight, bias, stride, padding, dilation, groups)
+    else:
+        return spike_op.spike_convolution.apply(spike, weight, bias, stride, padding, dilation, groups)

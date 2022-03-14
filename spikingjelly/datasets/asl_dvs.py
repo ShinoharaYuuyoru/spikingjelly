@@ -1,5 +1,4 @@
-from typing import Any, Callable, cast, Dict, List, Optional, Tuple
-import numpy as np
+from typing import Callable, Dict,  Optional, Tuple
 import spikingjelly.datasets as sjds
 from torchvision.datasets.utils import extract_archive
 import os
@@ -7,7 +6,8 @@ import multiprocessing
 from concurrent.futures import ThreadPoolExecutor
 import time
 import shutil
-from ..configure import max_threads_number_for_datasets_preprocess
+from .. import configure
+from ..datasets import np_savez
 
 class ASLDVS(sjds.NeuromorphicDatasetFolder):
     def __init__(
@@ -22,69 +22,11 @@ class ASLDVS(sjds.NeuromorphicDatasetFolder):
             transform: Optional[Callable] = None,
             target_transform: Optional[Callable] = None,
     ) -> None:
-        '''
-        :param root: root path of the dataset
-        :type root: str
-        :param data_type: `event` or `frame`
-        :type data_type: str
-        :param frames_number: the integrated frame number
-        :type frames_number: int
-        :param split_by: `time` or `number`
-        :type split_by: str
-        :param duration: the time duration of each frame
-        :type duration: int
-        :param custom_integrate_function: a user-defined function that inputs are ``events, H, W``.
-            ``events`` is a dict whose keys are ``['t', 'x', 'y', 'p']`` and values are ``numpy.ndarray``
-            ``H`` is the height of the data and ``W`` is the weight of the data.
-            For example, H=128 and W=128 for the DVS128 Gesture dataset.
-            The user should define how to integrate events to frames, and return frames.
-        :type custom_integrate_function: Callable
-        :param custom_integrated_frames_dir_name: The name of directory for saving frames integrating by ``custom_integrate_function``.
-            If ``custom_integrated_frames_dir_name`` is ``None``, it will be set to ``custom_integrate_function.__name__``
-        :type custom_integrated_frames_dir_name: str or None
-        :param transform: a function/transform that takes in
-            a sample and returns a transformed version.
-            E.g, ``transforms.RandomCrop`` for images.
-        :type transform: callable
-        :param target_transform: a function/transform that takes
-            in the target and transforms it.
-        :type target_transform: callable
+        """
+        The ASL-DVS dataset, which is proposed by `Graph-based Object Classification for Neuromorphic Vision Sensing <https://openaccess.thecvf.com/content_ICCV_2019/html/Bi_Graph-Based_Object_Classification_for_Neuromorphic_Vision_Sensing_ICCV_2019_paper.html>`_.
 
-        If ``data_type == 'event'``
-            the sample in this dataset is a dict whose keys are ``['t', 'x', 'y', 'p']`` and values are ``numpy.ndarray``.
-
-        If ``data_type == 'frame'`` and ``frames_number`` is not ``None``
-            events will be integrated to frames with fixed frames number. ``split_by`` will define how to split events.
-            See :class:`spikingjelly.datasets.cal_fixed_frames_number_segment_index` for
-            more details.
-
-        If ``data_type == 'frame'``, ``frames_number`` is ``None``, and ``duration`` is not ``None``
-            events will be integrated to frames with fixed time duration.
-
-        If ``data_type == 'frame'``, ``frames_number`` is ``None``, ``duration`` is ``None``, and ``custom_integrate_function`` is not ``None``:
-            events will be integrated by the user-defined function and saved to the ``custom_integrated_frames_dir_name`` directory in ``root`` directory.
-            Here is an example from SpikingJelly's tutorials:
-
-            .. code-block:: python
-
-                from spikingjelly.datasets.dvs128_gesture import DVS128Gesture
-                from typing import Dict
-                import numpy as np
-                import spikingjelly.datasets as sjds
-                def integrate_events_to_2_frames_randomly(events: Dict, H: int, W: int):
-                    index_split = np.random.randint(low=0, high=events['t'].__len__())
-                    frames = np.zeros([2, 2, H, W])
-                    frames[0] = sjds.integrate_events_segment_to_frame(events, H, W, 0, index_split)
-                    frames[1] = sjds.integrate_events_segment_to_frame(events, H, W, index_split, events['t'].__len__())
-                    return frames
-
-                root_dir = 'D:/datasets/DVS128Gesture'
-                train_set = DVS128Gesture(root_dir, train=True, data_type='frame', custom_integrate_function=integrate_events_to_2_frames_randomly)
-
-                from spikingjelly.datasets import play_frame
-                frame, label = train_set[500]
-                play_frame(frame)
-        '''
+        Refer to :class:`spikingjelly.datasets.NeuromorphicDatasetFolder` for more details about params information.
+        """
         super().__init__(root, None, data_type, frames_number, split_by, duration, custom_integrate_function, custom_integrated_frames_dir_name, transform,
                          target_transform)
     @staticmethod
@@ -93,9 +35,10 @@ class ASLDVS(sjds.NeuromorphicDatasetFolder):
         :return: A list ``url`` that ``url[i]`` is a tuple, which contains the i-th file's name, download link, and MD5
         :rtype: list
         '''
+        print('The ICCV2019_DVS_dataset.zip is packed by dropbox. We find that the MD5 of this zip file can change. So, MD5 check will not be used for this ASL-DVS dataset.')
         url = 'https://www.dropbox.com/sh/ibq0jsicatn7l6r/AACNrNELV56rs1YInMWUs9CAa?dl=0'
         return [
-            ('ICCV2019_DVS_dataset.zip', url, '8b46191acf6c1760ad3f2d2cb4380e24')
+            ('ICCV2019_DVS_dataset.zip', url, None)
         ]
 
     @staticmethod
@@ -156,7 +99,7 @@ class ASLDVS(sjds.NeuromorphicDatasetFolder):
     @staticmethod
     def read_mat_save_to_np(mat_file: str, np_file: str):
         events = ASLDVS.load_origin_data(mat_file)
-        np.savez(np_file,
+        np_savez(np_file,
                  t=events['t'],
                  x=events['x'],
                  y=events['y'],
@@ -177,7 +120,7 @@ class ASLDVS(sjds.NeuromorphicDatasetFolder):
         This function defines how to convert the origin binary data in ``extract_root`` to ``npz`` format and save converted files in ``events_np_root``.
         '''
         t_ckp = time.time()
-        with ThreadPoolExecutor(max_workers=min(multiprocessing.cpu_count(), max_threads_number_for_datasets_preprocess)) as tpe:
+        with ThreadPoolExecutor(max_workers=min(multiprocessing.cpu_count(), configure.max_threads_number_for_datasets_preprocess)) as tpe:
             for class_name in os.listdir(extract_root):
                 mat_dir = os.path.join(extract_root, class_name)
                 np_dir = os.path.join(events_np_root, class_name)

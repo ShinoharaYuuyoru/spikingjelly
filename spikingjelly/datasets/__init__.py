@@ -1,5 +1,5 @@
 from torchvision.datasets import DatasetFolder
-from typing import Any, Callable, cast, Dict, List, Optional, Tuple
+from typing import  Callable, Dict, Optional, Tuple
 from abc import abstractmethod
 import scipy.io
 import struct
@@ -15,11 +15,13 @@ import torch
 from matplotlib import pyplot as plt
 import math
 import tqdm
-from ..configure import max_threads_number_for_datasets_preprocess, cuda_threads, cuda_compiler_options, cuda_compiler_backend
+import shutil
+from .. import configure
+np_savez = np.savez_compressed if configure.save_datasets_compressed else np.savez
 
 try:
     import cupy
-    from spikingjelly.clock_driven import cu_kernel_opt
+    from ..clock_driven import cu_kernel_opt
 
     padded_sequence_mask_kernel_code = r'''
     extern "C" __global__
@@ -35,7 +37,8 @@ try:
                 }
             }
     '''
-except ImportError:
+except BaseException as e:
+    print('spikingjelly.dataset.__init__:', e)
     cupy = None
     pass
 
@@ -339,8 +342,10 @@ def integrate_events_by_fixed_frames_number(events: Dict, split_by: str, frames_
         frames[i] = integrate_events_segment_to_frame(events, H, W, j_l[i], j_r[i])
     return frames
 
-def integrate_events_file_to_frames_file_by_fixed_frames_number(events_np_file: str, output_dir: str, split_by: str, frames_num: int, H: int, W: int, print_save: bool = False) -> None:
+def integrate_events_file_to_frames_file_by_fixed_frames_number(loader: Callable, events_np_file: str, output_dir: str, split_by: str, frames_num: int, H: int, W: int, print_save: bool = False) -> None:
     '''
+    :param loader: a function that can load events from `events_np_file`
+    :type loader: Callable
     :param events_np_file: path of the events np file
     :type events_np_file: str
     :param output_dir: output directory for saving the frames
@@ -360,7 +365,7 @@ def integrate_events_file_to_frames_file_by_fixed_frames_number(events_np_file: 
     Integrate a events file to frames by fixed frames number and save it. See :class:`cal_fixed_frames_number_segment_index` and :class:`integrate_events_segment_to_frame` for more details.
     '''
     fname = os.path.join(output_dir, os.path.basename(events_np_file))
-    np.savez(fname, frames=integrate_events_by_fixed_frames_number(np.load(events_np_file), split_by, frames_num, H, W))
+    np_savez(fname, frames=integrate_events_by_fixed_frames_number(loader(events_np_file), split_by, frames_num, H, W))
     if print_save:
         print(f'Frames [{fname}] saved.')
 
@@ -402,8 +407,10 @@ def integrate_events_by_fixed_duration(events: Dict, duration: int, H: int, W: i
         if right == N:
             return np.concatenate(frames)
 
-def integrate_events_file_to_frames_file_by_fixed_duration(events_np_file: str, output_dir: str, duration: int, H: int, W: int, print_save: bool = False) -> None:
+def integrate_events_file_to_frames_file_by_fixed_duration(loader: Callable, events_np_file: str, output_dir: str, duration: int, H: int, W: int, print_save: bool = False) -> None:
     '''
+    :param loader: a function that can load events from `events_np_file`
+    :type loader: Callable
     :param events_np_file: path of the events np file
     :type events_np_file: str
     :param output_dir: output directory for saving the frames
@@ -420,16 +427,16 @@ def integrate_events_file_to_frames_file_by_fixed_duration(events_np_file: str, 
 
     Integrate events to frames by fixed time duration of each frame.
     '''
-    frames = integrate_events_by_fixed_duration(np.load(events_np_file), duration, H, W)
+    frames = integrate_events_by_fixed_duration(loader(events_np_file), duration, H, W)
     fname, _ = os.path.splitext(os.path.basename(events_np_file))
     fname = os.path.join(output_dir, f'{fname}_{frames.shape[0]}.npz')
-    np.savez(fname, frames=frames)
+    np_savez(fname, frames=frames)
     if print_save:
         print(f'Frames [{fname}] saved.')
     return frames.shape[0]
 
 def save_frames_to_npz_and_print(fname: str, frames):
-    np.savez(fname, frames=frames)
+    np_savez(fname, frames=frames)
     print(f'Frames [{fname}] saved.')
 
 def create_same_directory_structure(source_dir: str, target_dir: str) -> None:
@@ -461,7 +468,7 @@ def split_to_train_test_set(train_ratio: float, origin_dataset: torch.utils.data
     :param random_split: If ``False``, the front ratio of samples in each classes will
             be included in train set, while the reset will be included in test set.
             If ``True``, this function will split samples in each classes randomly. The randomness is controlled by
-            ``numpy.randon.seed``
+            ``numpy.random.seed``
     :type random_split: int
     :return: a tuple ``(train_set, test_set)``
     :rtype: tuple
@@ -583,10 +590,10 @@ def padded_sequence_mask(sequence_len: torch.Tensor, T=None):
             N = cupy.asarray(N)
             sequence_len, mask, T, N = cu_kernel_opt.get_contiguous(sequence_len.to(torch.int), mask, T, N)
             kernel_args = [sequence_len, mask, T, N]
-            kernel = cupy.RawKernel(padded_sequence_mask_kernel_code, 'padded_sequence_mask_kernel', options=cuda_compiler_options, backend=cuda_compiler_backend)
+            kernel = cupy.RawKernel(padded_sequence_mask_kernel_code, 'padded_sequence_mask_kernel', options=configure.cuda_compiler_options, backend=configure.cuda_compiler_backend)
             blocks = cu_kernel_opt.cal_blocks(N)
             kernel(
-                (blocks,), (cuda_threads,),
+                (blocks,), (configure.cuda_threads,),
                 cu_kernel_opt.wrap_args_to_raw_kernel(
                     device_id,
                     *kernel_args
@@ -771,7 +778,7 @@ class NeuromorphicDatasetFolder(DatasetFolder):
 
                     # use multi-thread to accelerate
                     t_ckp = time.time()
-                    with ThreadPoolExecutor(max_workers=min(multiprocessing.cpu_count(), max_threads_number_for_datasets_preprocess)) as tpe:
+                    with ThreadPoolExecutor(max_workers=min(multiprocessing.cpu_count(), configure.max_threads_number_for_datasets_preprocess)) as tpe:
                         print(f'Start ThreadPoolExecutor with max workers = [{tpe._max_workers}].')
                         for e_root, e_dirs, e_files in os.walk(events_np_root):
                             if e_files.__len__() > 0:
@@ -779,7 +786,7 @@ class NeuromorphicDatasetFolder(DatasetFolder):
                                 for e_file in e_files:
                                     events_np_file = os.path.join(e_root, e_file)
                                     print(f'Start to integrate [{events_np_file}] to frames and save to [{output_dir}].')
-                                    tpe.submit(integrate_events_file_to_frames_file_by_fixed_frames_number, events_np_file, output_dir, split_by, frames_number, H, W, True)
+                                    tpe.submit(integrate_events_file_to_frames_file_by_fixed_frames_number, self.load_events_np, events_np_file, output_dir, split_by, frames_number, H, W, True)
 
                     print(f'Used time = [{round(time.time() - t_ckp, 2)}s].')
 
@@ -801,7 +808,7 @@ class NeuromorphicDatasetFolder(DatasetFolder):
                     create_same_directory_structure(events_np_root, frames_np_root)
                     # use multi-thread to accelerate
                     t_ckp = time.time()
-                    with ThreadPoolExecutor(max_workers=min(multiprocessing.cpu_count(), max_threads_number_for_datasets_preprocess)) as tpe:
+                    with ThreadPoolExecutor(max_workers=min(multiprocessing.cpu_count(), configure.max_threads_number_for_datasets_preprocess)) as tpe:
                         print(f'Start ThreadPoolExecutor with max workers = [{tpe._max_workers}].')
                         for e_root, e_dirs, e_files in os.walk(events_np_root):
                             if e_files.__len__() > 0:
@@ -809,7 +816,7 @@ class NeuromorphicDatasetFolder(DatasetFolder):
                                 for e_file in e_files:
                                     events_np_file = os.path.join(e_root, e_file)
                                     print(f'Start to integrate [{events_np_file}] to frames and save to [{output_dir}].')
-                                    tpe.submit(integrate_events_file_to_frames_file_by_fixed_duration, events_np_file, output_dir, duration, H, W, True)
+                                    tpe.submit(integrate_events_file_to_frames_file_by_fixed_duration, self.load_events_np, events_np_file, output_dir, duration, H, W, True)
 
                     print(f'Used time = [{round(time.time() - t_ckp, 2)}s].')
 
@@ -832,7 +839,7 @@ class NeuromorphicDatasetFolder(DatasetFolder):
                     create_same_directory_structure(events_np_root, frames_np_root)
                     # use multi-thread to accelerate
                     t_ckp = time.time()
-                    with ThreadPoolExecutor(max_workers=min(multiprocessing.cpu_count(), max_threads_number_for_datasets_preprocess)) as tpe:
+                    with ThreadPoolExecutor(max_workers=min(multiprocessing.cpu_count(), configure.max_threads_number_for_datasets_preprocess)) as tpe:
                         print(f'Start ThreadPoolExecutor with max workers = [{tpe._max_workers}].')
                         for e_root, e_dirs, e_files in os.walk(events_np_root):
                             if e_files.__len__() > 0:
@@ -860,21 +867,8 @@ class NeuromorphicDatasetFolder(DatasetFolder):
             else:
                 _root = os.path.join(_root, 'test')
 
-        super().__init__(root=_root, loader=_loader, extensions='.npz', transform=_transform,
+        super().__init__(root=_root, loader=_loader, extensions=('.npz', ), transform=_transform,
                          target_transform=_target_transform)
-
-    @staticmethod
-    @abstractmethod
-    def load_origin_data(file_name: str) -> Dict:
-        '''
-        :param file_name: path of the events file
-        :type file_name: str
-        :return: a dict whose keys are ``['t', 'x', 'y', 'p']`` and values are ``numpy.ndarray``
-        :rtype: Dict
-
-        This function defines how to read the origin binary data.
-        '''
-        pass
 
     @staticmethod
     @abstractmethod
@@ -932,5 +926,125 @@ class NeuromorphicDatasetFolder(DatasetFolder):
         '''
         pass
 
+    @staticmethod
+    def load_events_np(fname: str):
+        '''
+        :param fname: file name
+        :return: a dict whose keys are ``['t', 'x', 'y', 'p']`` and values are ``numpy.ndarray``
+
+        This function defines how to load a sample from `events_np`. In most cases, this function is `np.load`.
+        But for some datasets, e.g., ES-ImageNet, it can be different.
+        '''
+        return np.load(fname)
 
 
+
+def random_temporal_delete(x_seq: torch.Tensor or np.ndarray, T_remain: int, batch_first):
+    """
+    :param x_seq: a sequence with `shape = [T, N, *]`, where `T` is the sequence length and `N` is the batch size
+    :type x_seq: torch.Tensor or np.ndarray
+    :param T_remain: the remained length
+    :type T_remain: int
+    :param batch_first: if `True`, `x_seq` will be regarded as `shape = [N, T, *]`
+    :type batch_first: bool
+    :return: the sequence with length `T_remain`, which is obtained by randomly removing `T - T_remain` slices
+    :rtype: torch.Tensor or np.ndarray
+
+    The random temporal delete data augmentation used in `Deep Residual Learning in Spiking Neural Networks <https://arxiv.org/abs/2102.04159>`_.
+
+    Codes example:
+
+    .. code-block:: python
+
+        import torch
+        from spikingjelly.datasets import random_temporal_delete
+        T = 8
+        T_remain = 5
+        N = 4
+        x_seq = torch.arange(0, N*T).view([N, T])
+        print('x_seq=\\n', x_seq)
+        print('random_temporal_delete(x_seq)=\\n', random_temporal_delete(x_seq, T_remain, batch_first=True))
+
+    Outputs:
+
+    .. code-block:: shell
+
+        x_seq=
+         tensor([[ 0,  1,  2,  3,  4,  5,  6,  7],
+                [ 8,  9, 10, 11, 12, 13, 14, 15],
+                [16, 17, 18, 19, 20, 21, 22, 23],
+                [24, 25, 26, 27, 28, 29, 30, 31]])
+        random_temporal_delete(x_seq)=
+         tensor([[ 0,  1,  4,  6,  7],
+                [ 8,  9, 12, 14, 15],
+                [16, 17, 20, 22, 23],
+                [24, 25, 28, 30, 31]])
+    """
+    if batch_first:
+        sec_list = np.random.choice(x_seq.shape[1], T_remain, replace=False)
+    else:
+        sec_list = np.random.choice(x_seq.shape[0], T_remain, replace=False)
+    sec_list.sort()
+    if batch_first:
+        return x_seq[:, sec_list]
+    else:
+        return x_seq[sec_list]
+
+class RandomTemporalDelete(torch.nn.Module):
+    def __init__(self, T_remain: int, batch_first: bool):
+        """
+        :param T_remain: the remained length
+        :type T_remain: int
+        :type T_remain: int
+        :param batch_first: if `True`, `x_seq` will be regarded as `shape = [N, T, *]`
+
+        The random temporal delete data augmentation used in `Deep Residual Learning in Spiking Neural Networks <https://arxiv.org/abs/2102.04159>`_.
+
+        Refer to :class:`random_temporal_delete` for more details.
+        """
+        super().__init__()
+        self.T_remain = T_remain
+        self.batch_first = batch_first
+
+    def forward(self, x_seq: torch.Tensor or np.ndarray):
+        return random_temporal_delete(x_seq, self.T_remain, self.batch_first)
+
+
+def create_sub_dataset(source_dir: str, target_dir:str, ratio: float, use_soft_link=True, randomly=False):
+    """
+    :param source_dir: the directory path of the origin dataset
+    :type source_dir: str
+    :param target_dir: the directory path of the sub dataset
+    :type target_dir: str
+    :param ratio: the ratio of samples sub dataset will copy from the origin dataset
+    :type ratio: float
+    :param use_soft_link: if ``True``, the sub dataset will use soft link to copy; else, the sub dataset will copy files
+    :type use_soft_link: bool
+    :param randomly: if ``True``, the files copy from the origin dataset will be picked up randomly. The randomness is controlled by
+            ``numpy.random.seed``
+    :type randomly: bool
+
+    Create a sub dataset with copy ``ratio`` of samples from the origin dataset.
+    """
+    if not os.path.exists(target_dir):
+        os.makedirs(target_dir)
+        print(f'Mkdir [{target_dir}].')
+    create_same_directory_structure(source_dir, target_dir)
+    for e_root, e_dirs, e_files in os.walk(source_dir, followlinks=True):
+        if e_files.__len__() > 0:
+            output_dir = os.path.join(target_dir, os.path.relpath(e_root, source_dir))
+            samples_number = int(ratio * e_files.__len__())
+            if randomly:
+                np.random.shuffle(e_files)
+            for i, e_file in enumerate(e_files):
+                if i >= samples_number:
+                    break
+                source_file = os.path.join(e_root, e_file)
+                target_file = os.path.join(output_dir, os.path.basename(source_file))
+                if use_soft_link:
+                    os.symlink(source_file, target_file)
+                    # print(f'symlink {source_file} -> {target_file}')
+                else:
+                    shutil.copyfile(source_file, target_file)
+                    # print(f'copyfile {source_file} -> {target_file}')
+            print(f'[{samples_number}] files in [{e_root}] have been copied to [{output_dir}].')
